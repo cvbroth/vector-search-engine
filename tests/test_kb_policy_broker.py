@@ -88,16 +88,23 @@ class BrokerTests(unittest.TestCase):
         self.assertIsNone(self.policy.resolve("unknown", "PRIVATE"))
 
     def test_handler_routes_all_four_agents(self) -> None:
+        resolved: list[str] = []
+
         def fake_forward(query: str, scope: str, top_k: int) -> dict:
             self.assertEqual(query, "问题")
             self.assertEqual(top_k, 3)
+            resolved.append(scope)
             return context("ACCEPT", query, scope)
 
         with patch.object(broker, "forward_context", side_effect=fake_forward) as forward:
             for agent in ("main", "chen"):
                 status, payload = request(self.policy, "/v1/private-context",
                                           {"agent_id": agent, "query": "问题", "top_k": 3})
-                self.assertEqual((status, payload["scopes"]), (200, ["chen"]))
+                self.assertEqual(status, 200)
+                self.assertEqual(payload["retrieval_status"], "ACCEPT")
+                self.assertNotIn("scopes", payload)
+                self.assertNotIn("scope", payload["evidence"][0])
+                self.assertNotIn("source_path", payload["evidence"][0])
             for agent in ("liang", "ziling"):
                 status, payload = request(self.policy, "/v1/private-context",
                                           {"agent_id": agent, "query": "问题", "top_k": 3})
@@ -106,8 +113,10 @@ class BrokerTests(unittest.TestCase):
             for agent in POLICY["agents"]:
                 status, payload = request(self.policy, "/v1/shared-context",
                                           {"agent_id": agent, "query": "问题", "top_k": 3})
-                self.assertEqual((status, payload["scopes"]), (200, ["family"]))
+                self.assertEqual(status, 200)
+                self.assertNotIn("scopes", payload)
             self.assertEqual(forward.call_count, 6)
+            self.assertEqual(resolved, ["chen", "chen", "family", "family", "family", "family"])
 
     def test_unknown_missing_agent_and_disabled_shared(self) -> None:
         with patch.object(broker, "forward_context") as forward:
@@ -190,6 +199,17 @@ class BrokerTests(unittest.TestCase):
     def test_backend_response_validation(self) -> None:
         valid = context("ACCEPT", "q", "chen")
         self.assertEqual(broker.validate_backend_context(valid, "q", "chen", 5), valid)
+        public = broker.to_model_context(valid, "q", "chen", 5)
+        self.assertEqual(set(public), {
+            "schema_version", "query", "retrieval_status", "evidence_count", "evidence",
+        })
+        self.assertEqual(set(public["evidence"][0]), {
+            "rank", "fused_score", "semantic_score", "semantic_distance",
+            "lexical_match", "lexical_score", "relevance_decision", "filename",
+            "page", "chunk_index", "text",
+        })
+        self.assertNotIn("/srv/storage/knowledge/", json.dumps(public))
+        self.assertEqual(broker.to_model_context(context("REJECT", "q", "chen"), "q", "chen", 5)["evidence"], [])
         for invalid in [
             {**valid, "retrieval_status": []},
             {**valid, "scopes": ["family"]},
@@ -198,6 +218,8 @@ class BrokerTests(unittest.TestCase):
         ]:
             with self.assertRaises(broker.BackendError):
                 broker.validate_backend_context(invalid, "q", "chen", 5)
+            with self.assertRaises(broker.BackendError):
+                broker.to_model_context(invalid, "q", "chen", 5)
 
     def test_backend_transport_status_malformed_oversized_timeout(self) -> None:
         class FakeResponse:
@@ -210,8 +232,10 @@ class BrokerTests(unittest.TestCase):
         class FakeConnection:
             response = FakeResponse(200, b"")
             error: Exception | None = None
+            calls: list[tuple] = []
 
-            def request(self, *_args: object) -> None:
+            def request(self, *args: object) -> None:
+                self.calls.append(args)
                 if self.error:
                     raise self.error
 
@@ -223,6 +247,12 @@ class BrokerTests(unittest.TestCase):
 
         fake = FakeConnection()
         with patch.object(broker, "UnixBackendConnection", return_value=fake):
+            for scope in ("chen", "family"):
+                fake.response = FakeResponse(200, json.dumps(context("ACCEPT", "q", scope)).encode("utf-8"))
+                broker.forward_context("q", scope, 5)
+                method, endpoint, body, _headers = fake.calls[-1]
+                self.assertEqual((method, endpoint), ("POST", "/v1/context"))
+                self.assertEqual(json.loads(body), {"query": "q", "scopes": [scope], "top_k": 5})
             for status, body, expected in [
                 (500, b"{}", 500), (503, b"{}", 503),
                 (200, b"not json", 502),

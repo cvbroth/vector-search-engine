@@ -1,20 +1,18 @@
 /** Fixed local broker transport. Neither socket path nor scope is caller supplied. */
 import http from "node:http";
 import Value from "typebox/value";
-import { ragContextSchema } from "./contracts.js";
+import { modelContextSchema } from "./contracts.js";
 const SOCKET_PATH = "/run/knowledge-broker/query.sock";
 const TIMEOUT_MS = 10_000;
 const MAX_RESPONSE_BYTES = 1024 * 1024;
 function validateResponse(value, request) {
-    if (!Value.Check(ragContextSchema, value)) {
+    if (!Value.Check(modelContextSchema, value)) {
         throw new Error("knowledge broker protocol error: invalid RAG Context schema");
     }
     const context = value;
-    if (context.query !== request.query || context.scopes.length !== 1 ||
-        context.evidence_count !== context.evidence.length ||
+    if (context.query !== request.query || context.evidence_count !== context.evidence.length ||
         context.evidence_count > request.topK ||
-        context.evidence.some((item, index) => item.rank !== index + 1 ||
-            item.scope !== context.scopes[0])) {
+        context.evidence.some((item, index) => item.rank !== index + 1)) {
         throw new Error("knowledge broker protocol error: response does not match request");
     }
     const hasAccept = context.evidence.some((item) => item.relevance_decision === "ACCEPT");

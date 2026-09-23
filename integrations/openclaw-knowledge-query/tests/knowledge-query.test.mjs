@@ -15,14 +15,14 @@ const config = { agents: {
 } };
 const fixedSocket = "/run/knowledge-broker/query.sock";
 
-function context(status = "ACCEPT", query = "问题", scope = "family") {
+function context(status = "ACCEPT", query = "问题") {
   const evidence = status === "REJECT" ? [] : [{
-    scope, rank: 1, fused_score: 0.032787, semantic_score: 0.75,
+    rank: 1, fused_score: 0.032787, semantic_score: 0.75,
     semantic_distance: 0.25, lexical_match: true, lexical_score: -0.00001,
-    relevance_decision: status, source_path: `/srv/storage/knowledge/${scope === "chen" ? "private/chen" : "shared/family"}/test.md`,
+    relevance_decision: status,
     filename: "test.md", page: null, chunk_index: 0, text: "完整 chunk 文本",
   }];
-  return { schema_version: "1.0", query, scopes: [scope], retrieval_status: status,
+  return { schema_version: "1.0", query, retrieval_status: status,
     evidence_count: evidence.length, evidence };
 }
 
@@ -79,6 +79,10 @@ test("exactly two tools, with model schema limited to query and top_k", () => {
       assert.equal(Object.hasOwn(tool.parameters.properties, forbidden), false);
     }
     assert.equal(tool.parameters.additionalProperties, false);
+    assert.doesNotMatch(JSON.stringify(tool.outputSchema), /\b(?:scope|scopes|source_path|chen|family)\b/);
+    assert.equal(tool.outputSchema.additionalProperties, false);
+    assert.equal(tool.outputSchema.properties.evidence.items.additionalProperties, false);
+    assert.doesNotMatch(tool.description, /\b(?:chen|family)\b/);
   }
 });
 
@@ -96,13 +100,21 @@ test("trusted agent identity and fixed access route reach broker without scope",
   await fakeBroker(t, async (request, response) => {
     const body = await bodyOf(request);
     seen.push({ path: request.url, body });
-    send(response, context("ACCEPT", body.query, request.url === "/v1/private-context" ? "chen" : "family"));
+    send(response, context("ACCEPT", body.query));
   });
   const found = factories();
   const privateTool = found.get("knowledge_private")({ agentId: "chenAgent" });
   const sharedTool = found.get("knowledge_shared")({ agentId: "chenAgent" });
-  assert.equal((await privateTool.execute("1", { query: "问题", top_k: 3 })).details.scopes[0], "chen");
-  assert.equal((await sharedTool.execute("2", { query: "问题" })).details.scopes[0], "family");
+  const privateResult = await privateTool.execute("1", { query: "问题", top_k: 3 });
+  const sharedResult = await sharedTool.execute("2", { query: "问题" });
+  for (const result of [privateResult, sharedResult]) {
+    assert.equal(result.details.retrieval_status, "ACCEPT");
+    for (const forbidden of ["scope", "scopes", "source_path"]) {
+      assert.equal(Object.hasOwn(result.details, forbidden), false);
+      assert.equal(Object.hasOwn(result.details.evidence[0], forbidden), false);
+      assert.equal(Object.hasOwn(JSON.parse(result.content[0].text), forbidden), false);
+    }
+  }
   assert.deepEqual(seen, [
     { path: "/v1/private-context", body: { agent_id: "chenAgent", query: "问题", top_k: 3 } },
     { path: "/v1/shared-context", body: { agent_id: "chenAgent", query: "问题", top_k: 5 } },
@@ -118,6 +130,7 @@ test("ACCEPT, UNCERTAIN, and empty REJECT preserve RAG Context", async (t) => {
     assert.equal(result.details.retrieval_status, status);
     assert.equal(result.details.evidence_count, status === "REJECT" ? 0 : 1);
     assert.deepEqual(JSON.parse(result.content[0].text), result.details);
+    assert.doesNotMatch(result.content[0].text, /"(?:scope|scopes|source_path)"\s*:/);
   }
 });
 
@@ -136,11 +149,22 @@ test("model cannot inject agent, scope, path, URL, or bad arguments", async (t) 
 });
 
 test("malformed or inconsistent broker responses are errors", async (t) => {
+  const badEvidence = (changes) => JSON.stringify({
+    ...context(), evidence: [{ ...context().evidence[0], ...changes }],
+  });
   const responses = [
     "not-json", JSON.stringify({ ...context(), schema_version: "9.9" }),
     JSON.stringify({ ...context(), evidence_count: 2 }),
     JSON.stringify({ ...context(), query: "other" }),
     JSON.stringify({ ...context(), scopes: ["chen", "family"] }),
+    badEvidence({ source_path: "/private/chen" }),
+    badEvidence({ semantic_score: "0.75" }),
+    badEvidence({ lexical_match: "true" }),
+    badEvidence({ filename: null }),
+    badEvidence({ page: 0 }),
+    badEvidence({ chunk_index: -1 }),
+    badEvidence({ text: null }),
+    badEvidence({ rank: 2 }),
     JSON.stringify({ ...context(), evidence: [{ ...context().evidence[0], relevance_decision: "REJECT" }] }),
   ];
   let index = 0;

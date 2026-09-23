@@ -1,7 +1,7 @@
 {
   "id": "local-knowledge-query",
   "name": "Local Knowledge Query",
-  "description": "Read-only private and family-shared NAS knowledge tools via the local policy broker.",
+  "description": "Read-only private and household-shared NAS knowledge tools via the local policy broker.",
   "version": "0.1.0",
   "configSchema": {
     "type": "object",

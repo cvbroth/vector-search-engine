@@ -1,7 +1,7 @@
 /** Two model-facing capabilities; the trusted tool context supplies agent identity. */
 
 import { defineToolPlugin } from "openclaw/plugin-sdk/tool-plugin";
-import { configSchema, ragContextSchema, staticParameters } from "./contracts.js";
+import { configSchema, modelContextSchema, staticParameters } from "./contracts.js";
 import { queryBroker, type AccessKind } from "./unix-client.js";
 
 const CAUTION = "Retrieval relevance is not answerability. Inspect evidence text; ACCEPT never licenses invented facts. UNCERTAIN may still be useful; REJECT with empty evidence is a valid no-evidence result.";
@@ -45,9 +45,9 @@ export function createKnowledgeTool(kind: AccessKind, config: unknown, agentId: 
   return {
     name: isPrivate ? "knowledge_private" : "knowledge_shared",
     label: isPrivate ? "Private Knowledge" : "Shared Knowledge",
-    description: `${isPrivate ? "Query this agent's authorized private NAS knowledge." : "Query the authorized family-shared NAS knowledge."} ${CAUTION}`,
+    description: `${isPrivate ? "Query this agent's authorized private NAS knowledge." : "Query authorized household-shared NAS knowledge."} ${CAUTION}`,
     parameters: staticParameters,
-    outputSchema: ragContextSchema,
+    outputSchema: modelContextSchema,
     async execute(_toolCallId: string, rawParams: unknown, signal?: AbortSignal) {
       const { query, topK } = validateParameters(rawParams);
       const result = await queryBroker({ kind, agentId: trustedAgentId, query, topK, signal });
@@ -59,12 +59,12 @@ export function createKnowledgeTool(kind: AccessKind, config: unknown, agentId: 
 export default defineToolPlugin({
   id: "local-knowledge-query",
   name: "Local Knowledge Query",
-  description: "Read-only private and family-shared NAS knowledge tools via the local policy broker.",
+  description: "Read-only private and household-shared NAS knowledge tools via the local policy broker.",
   configSchema,
   tools: (tool) => (["private", "shared"] as const).map((kind) => tool({
     name: kind === "private" ? "knowledge_private" : "knowledge_shared",
     label: kind === "private" ? "Private Knowledge" : "Shared Knowledge",
-    description: `${kind === "private" ? "Query this agent's authorized private NAS knowledge." : "Query the authorized family-shared NAS knowledge."} ${CAUTION}`,
+    description: `${kind === "private" ? "Query this agent's authorized private NAS knowledge." : "Query authorized household-shared NAS knowledge."} ${CAUTION}`,
     parameters: staticParameters,
     factory({ config, toolContext }) {
       return createKnowledgeTool(kind, config, toolContext.agentId);

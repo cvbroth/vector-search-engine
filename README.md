@@ -208,9 +208,34 @@ Policy schema `1.0` 顶层只包含 `schema_version`、`shared_scope`（当前�
 
 Broker 只接受 `POST /v1/private-context` 或 `POST /v1/shared-context`，请求体为 `{"agent_id":"chen","query":"问题","top_k":5}`。前者用 policy 的该 Agent `private_scope`；后者先检查 `shared=true`，再用 policy `shared_scope`。由 Broker 而非模型生成后端的 `scopes=[...]`。`GET /health` 只返回状态与 schema 版本，不暴露 ACL/用户列表。请求字段严格限制为 `agent_id`、`query`、`top_k`；query 最多 4096 字符，top_k 为 1–10。授权失败返回 403，输入错误 400；正常无证据返回 200/REJECT/空 evidence；后端超时或故障返回 5xx，绝不伪装成 REJECT。
 
+Broker 先严格验证 backend 的内部 RAG Context（其中仍有 `scope`、`scopes`、`source_path`），然后明确投影为给插件/模型的 schema `1.0`。顶层只含 `schema_version`、`query`、`retrieval_status`、`evidence_count`、`evidence`；每条 evidence 只含 `rank`、`fused_score`、`semantic_score`、`semantic_distance`、`lexical_match`、`lexical_score`、`relevance_decision`、`filename`、`page`、`chunk_index`、`text`。外部结果与插件 outputSchema 都不含内部 scope 名或 `source_path`。后端 `kb_service.py` 的 RAG Context 协议保持原样。文档正文或文件名本身若提到这些普通词语，不属于结构字段清理范围。
+
+Broker 的 systemd unit 示例（`knowledge-broker.service`，**未在真实服务器部署**）：
+
+```ini
+[Unit]
+Description=Local knowledge-base policy broker
+After=knowledge-base.service
+Requires=knowledge-base.service
+
+[Service]
+Type=simple
+User=chen
+WorkingDirectory=/opt/knowledge-base
+ExecStart=/opt/knowledge-base/.venv/bin/python /opt/knowledge-base/kb_policy_broker.py
+RuntimeDirectory=knowledge-broker
+RuntimeDirectoryMode=0750
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+```
+
+示例假定 `knowledge-base.service` 已按上文使用 backend socket，且 `chen` 可读取 `/etc/knowledge-broker/policy.json`、连接 backend socket。实际安装路径、unit 名称、目录与组权限须在服务器部署前核对；仅增加 unit 文本不会自动建立隔离或开放容器访问。
+
 Broker 为每次 POST 写结构化 audit：UTC 时间、UUID4 request_id、Agent ID、PRIVATE/SHARED、解析出的 scope、ALLOW/DENY/ERROR、retrieval_status、evidence_count、耗时，以及 Linux 支持时的 peer UID/GID/PID。默认仅记录 query 长度与 SHA-256 前缀，不记录完整 query、evidence 或 chunk。应将日志权限限制在可信管理员范围。
 
-OpenClaw 插件只请求 Broker socket，模型仅看到 `knowledge_private(query, top_k?)` 与 `knowledge_shared(query, top_k?)`；模型参数不含 Agent ID 或 scope。插件从可信 `toolContext.agentId` 注入身份，本地 `agents: {id: {private:boolean, shared:boolean}}` 只用于工具可见性/第一层防误调用，**Broker policy 是最终 ACL**。详见 [`integrations/openclaw-knowledge-query/README.md`](integrations/openclaw-knowledge-query/README.md)。同一个 Gateway/容器/Unix UID 中，拥有任意代码执行能力的 Agent 理论上仍可直连 Broker socket 并伪造 JSON 中的 `agent_id`；此设计不是密码学身份认证或强租户隔离。未来需要 per-agent sandbox、独立 UID/容器或 capability boundary。切勿宣称当前 Broker 能防任意代码执行攻击。
+OpenClaw 插件只请求 Broker socket，模型仅看到 `knowledge_private(query, top_k?)` 与 `knowledge_shared(query, top_k?)`；模型参数和模型侧结构化结果均不含 Agent ID 或内部 scope。插件从可信 `toolContext.agentId` 注入身份，本地 `agents: {id: {private:boolean, shared:boolean}}` 只用于工具可见性/第一层防误调用，**Broker policy 是最终 ACL**。详见 [`integrations/openclaw-knowledge-query/README.md`](integrations/openclaw-knowledge-query/README.md)。同一个 Gateway/容器/Unix UID 中，拥有任意代码执行能力的 Agent 理论上仍可直连 Broker socket 并伪造 JSON 中的 `agent_id`；此设计不是密码学身份认证或强租户隔离。未来需要 per-agent sandbox、独立 UID/容器或 capability boundary。切勿宣称当前 Broker 能防任意代码执行攻击。
 
 ## 相关度标定
 

@@ -8,7 +8,8 @@
      → /run/knowledge-broker/query.sock
      → 宿主机 Broker 根据 policy 解析 scope
      → /run/knowledge-base/backend.sock
-     → kb_service.py /v1/context → RAG Context JSON
+     → kb_service.py /v1/context → 内部 RAG Context
+     → Broker 严格校验并去除内部 scope/path → 模型侧 Context JSON
 ```
 
 插件只用 Node 内置 `http.request({socketPath})` 对 Broker 发请求，不调用 shell、其他命令行客户端、NAS 文件或 SQLite，也不提供 TCP/任意 URL。私人/共享分别固定调用 `POST /v1/private-context` 与 `POST /v1/shared-context`。`agent_id` 由插件从 OpenClaw 运行时上下文注入，绝不取自模型参数。
@@ -46,7 +47,9 @@ pnpm run plugin:validate
 
 ## 结果和错误
 
-正常 `HTTP 200` 返回既有 RAG Context JSON。空证据、`retrieval_status=REJECT` 是一次成功检索；`403` 权限拒绝、`400` 请求错误、`5xx` 后端故障、无效协议、超时、取消或超过 1 MiB 的响应都作为工具错误，不伪装成 REJECT。插件超时为 10 秒。
+正常 `HTTP 200` 返回 Broker 转换后的模型侧 Context JSON。顶层字段为 `schema_version`、`query`、`retrieval_status`、`evidence_count`、`evidence`；证据保留排名、评分诊断、decision、`filename`、`page`、`chunk_index` 与完整 `text`，但没有 `scope`、`scopes` 或 `source_path`。插件对响应字段类型、结果数量、顺序和状态一致性再次验证，输出 schema 设置 `additionalProperties=false`，且不含内部 `chen`/`family` 名称。Backend 内部协议仍保留完整 RAG Context。
+
+空证据、`retrieval_status=REJECT` 是一次成功检索；`403` 权限拒绝、`400` 请求错误、`5xx` 后端故障、无效协议、超时、取消或超过 1 MiB 的响应都作为工具错误，不伪装成 REJECT。插件超时为 10 秒。
 
 `retrieval_status` 只是检索相关性，不是 answerability。`ACCEPT` 不证明文档能够回答问题，不能据此补事实；`UNCERTAIN` 仍须检查完整证据文本。
 

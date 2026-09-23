@@ -2,7 +2,7 @@
 
 import http from "node:http";
 import Value from "typebox/value";
-import { ragContextSchema, type RagContext } from "./contracts.js";
+import { modelContextSchema, type ModelContext } from "./contracts.js";
 
 const SOCKET_PATH = "/run/knowledge-broker/query.sock";
 const TIMEOUT_MS = 10_000;
@@ -17,16 +17,14 @@ export type BrokerQuery = {
   signal?: AbortSignal;
 };
 
-function validateResponse(value: unknown, request: BrokerQuery): RagContext {
-  if (!Value.Check(ragContextSchema, value)) {
+function validateResponse(value: unknown, request: BrokerQuery): ModelContext {
+  if (!Value.Check(modelContextSchema, value)) {
     throw new Error("knowledge broker protocol error: invalid RAG Context schema");
   }
-  const context = value as RagContext;
-  if (context.query !== request.query || context.scopes.length !== 1 ||
-      context.evidence_count !== context.evidence.length ||
+  const context = value as ModelContext;
+  if (context.query !== request.query || context.evidence_count !== context.evidence.length ||
       context.evidence_count > request.topK ||
-      context.evidence.some((item, index) => item.rank !== index + 1 ||
-        item.scope !== context.scopes[0])) {
+      context.evidence.some((item, index) => item.rank !== index + 1)) {
     throw new Error("knowledge broker protocol error: response does not match request");
   }
   const hasAccept = context.evidence.some((item) => item.relevance_decision === "ACCEPT");
@@ -38,7 +36,7 @@ function validateResponse(value: unknown, request: BrokerQuery): RagContext {
   return context;
 }
 
-export function queryBroker(request: BrokerQuery): Promise<RagContext> {
+export function queryBroker(request: BrokerQuery): Promise<ModelContext> {
   if (request.kind !== "private" && request.kind !== "shared") {
     return Promise.reject(new Error("invalid knowledge access kind"));
   }
@@ -52,7 +50,7 @@ export function queryBroker(request: BrokerQuery): Promise<RagContext> {
 
   return new Promise((resolve, reject) => {
     let settled = false;
-    const finish = (error?: Error, value?: RagContext) => {
+    const finish = (error?: Error, value?: ModelContext) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);

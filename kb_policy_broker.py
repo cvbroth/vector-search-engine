@@ -218,6 +218,34 @@ def validate_backend_context(value: Any, query: str, scope: str, top_k: int) -> 
     return value
 
 
+def to_model_context(value: Any, query: str, scope: str, top_k: int) -> dict[str, Any]:
+    """Validate the internal protocol, then project only model-facing fields."""
+    internal = validate_backend_context(value, query, scope, top_k)
+    evidence = [
+        {
+            "rank": item["rank"],
+            "fused_score": item["fused_score"],
+            "semantic_score": item["semantic_score"],
+            "semantic_distance": item["semantic_distance"],
+            "lexical_match": item["lexical_match"],
+            "lexical_score": item["lexical_score"],
+            "relevance_decision": item["relevance_decision"],
+            "filename": item["filename"],
+            "page": item["page"],
+            "chunk_index": item["chunk_index"],
+            "text": item["text"],
+        }
+        for item in internal["evidence"]
+    ]
+    return {
+        "schema_version": internal["schema_version"],
+        "query": internal["query"],
+        "retrieval_status": internal["retrieval_status"],
+        "evidence_count": internal["evidence_count"],
+        "evidence": evidence,
+    }
+
+
 class UnixBackendConnection(http.client.HTTPConnection):
     def __init__(self) -> None:
         super().__init__("localhost", timeout=BACKEND_TIMEOUT_SECONDS)
@@ -367,7 +395,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 self._error(403, "private_knowledge_not_authorized" if kind == "PRIVATE" else "shared_knowledge_not_authorized")
                 return
             record["resolved_scope"] = scope
-            context = forward_context(query, scope, top_k)
+            context = to_model_context(forward_context(query, scope, top_k), query, scope, top_k)
             record["decision"] = "ALLOW"
             record["retrieval_status"] = context["retrieval_status"]
             record["evidence_count"] = context["evidence_count"]
