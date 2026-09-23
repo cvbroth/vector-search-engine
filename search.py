@@ -198,6 +198,33 @@ def hybrid_search(
     ]
 
 
+def search_scope(query: str, scope_name: str, top_k: int = 5) -> list[SearchResult]:
+    """Return one database's hybrid results with their original RRF scores."""
+    scope = get_scope(scope_name)
+    connection = connect_database(scope, create=False)
+    try:
+        hits = _hybrid_hits(connection, query, top_k, scope)
+    finally:
+        connection.close()
+    return [
+        SearchResult(
+            scope=scope.name,
+            rank=rank,
+            fused_score=hit.fused_score,
+            source_path=str(hit.row["source_path"]),
+            filename=str(hit.row["filename"]),
+            page=hit.row["page"],
+            chunk_index=int(hit.row["chunk_index"]),
+            snippet=_snippet(str(hit.row["text"])),
+            semantic_distance=hit.semantic_distance,
+            semantic_score=hit.semantic_score,
+            lexical_match=hit.lexical_match,
+            lexical_score=hit.lexical_score,
+        )
+        for rank, hit in enumerate(hits, start=1)
+    ]
+
+
 def search_scopes(query: str, scopes: list[str], top_k: int) -> list[SearchResult]:
     """Fuse per-database hybrid rankings without comparing their raw scores."""
     if not query.strip():

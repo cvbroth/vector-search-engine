@@ -11,6 +11,7 @@
 | `database.py` | 建立 SQLite、FTS5、sqlite-vec 表；事务式写入与删除 |
 | `ingest.py` | 仅扫描选定 scope，新增、跳过、重建或清理该库索引 |
 | `search.py` | 单库 FTS5 + 语义检索 RRF；另提供多库 `search_scopes()` API |
+| `calibrate_relevance.py` | 用人工标注查询记录单库 Top1 诊断分数，汇总并扫描候选阈值；不参与生产搜索 |
 
 ## 安装依赖
 
@@ -62,6 +63,28 @@ python search.py "赤狐星云" --scope family --debug-scores
 ```
 
 当前只提供诊断数据，**尚未启用无关查询过滤或拒答阈值**。后续应先收集相关与无关查询的实测分数分布，再决定 relevance gate；无关查询现在仍可能有语义 Top-K 结果。
+
+## 相关度标定
+
+准备一个 UTF-8 JSON 数组；每条查询必须标注 `query`、白名单 scope（`chen` 或 `family`）和布尔值 `expected_relevant`：
+
+```json
+[
+  {"query": "家庭共享服务器叫什么？", "scope": "family", "expected_relevant": true},
+  {"query": "量子引力黑洞蒸发霍金辐射的实验验证", "scope": "family", "expected_relevant": false}
+]
+```
+
+```bash
+python calibrate_relevance.py relevance_cases.json
+python calibrate_relevance.py relevance_cases.json --output results.json
+```
+
+脚本调用 `search.py` 的单库 Hybrid Search，记录每条查询的 Top1：`query`、`scope`、`expected_relevant`、`filename`、`chunk_index`、`semantic_score`、`semantic_distance`、`lexical_match`、`lexical_score` 和单库原有 `fused_score`。没有结果时仍保留该样本，`has_result=false` 且结果字段为 `null`；单条查询失败会记录 `error`，并使进程返回非零状态，不会误当作“无结果”。
+
+控制台显示每条结果、正负样本数、两组语义分数的 min/median/max，以及 `lexical_match=true` 的比例。无结果样本计入标签数量和比例分母，但没有语义分数；出错样本不进入统计比例和阈值计算。`--output` 另外写入机器可读的 JSON，包含 `cases`、`summary`、完整的 `threshold_scan` 和按 F1 排名前五的 `best_thresholds`。不要将输出文件设为输入测试集本身。
+
+阈值扫描只尝试测试集中出现过的 Top1 `semantic_score` 值。规则为 `semantic_score >= threshold` 判为相关；无结果或缺少语义分数判为不相关。对每个候选计算 TP、FP、TN、FN、precision、recall、F1；同分时按 precision、recall、阈值降序稳定排序。所有阈值仅是**诊断建议**：样本少或不具代表性时不能视作生产阈值；脚本不会修改 `search.py` 的默认返回或增加拒答过滤。
 
 ## 数据库结构
 
