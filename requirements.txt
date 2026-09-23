@@ -1,0 +1,3 @@
+sqlite-vec==0.1.9
+pypdf
+python-docx
