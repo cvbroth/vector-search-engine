@@ -1,95 +1,71 @@
-/** Agent-scoped OpenClaw tool: authorization first, then fixed Unix transport. */
+/** Two model-facing capabilities; the trusted tool context supplies agent identity. */
 import { defineToolPlugin } from "openclaw/plugin-sdk/tool-plugin";
-import { configSchema, parametersForScopes, ragContextSchema, staticParameters, } from "./contracts.js";
-import { queryKnowledgeBase } from "./unix-client.js";
-const TOOL_DESCRIPTION = [
-    "Query the local NAS knowledge base for evidence. retrieval_status describes retrieval relevance, not final answerability.",
-    "ACCEPT does not prove the evidence answers the question; inspect the actual text before making factual claims.",
-    "UNCERTAIN evidence still requires your own answerability check.",
-    "REJECT with empty evidence means retrieval found no sufficiently relevant evidence.",
-    "Never generate facts solely because retrieval_status is ACCEPT.",
-].join(" ");
-function isScope(value) {
-    return value === "chen" || value === "family";
+import { configSchema, ragContextSchema, staticParameters } from "./contracts.js";
+import { queryBroker } from "./unix-client.js";
+const CAUTION = "Retrieval relevance is not answerability. Inspect evidence text; ACCEPT never licenses invented facts. UNCERTAIN may still be useful; REJECT with empty evidence is a valid no-evidence result.";
+function capability(config, agentId, kind) {
+    if (typeof agentId !== "string" || !agentId || !config || typeof config !== "object")
+        return false;
+    const agents = config.agents;
+    if (!agents || typeof agents !== "object" || Array.isArray(agents) ||
+        !Object.hasOwn(agents, agentId))
+        return false;
+    const entry = agents[agentId];
+    if (!entry || typeof entry !== "object" || Array.isArray(entry))
+        return false;
+    const flags = entry;
+    return typeof flags.private === "boolean" && typeof flags.shared === "boolean" &&
+        flags[kind] === true;
 }
-function allowedForAgent(config, agentId) {
-    if (!agentId || typeof agentId !== "string" || !config || typeof config !== "object") {
-        return null;
-    }
-    const agentScopes = config.agentScopes;
-    if (!agentScopes || typeof agentScopes !== "object" || Array.isArray(agentScopes) ||
-        !Object.hasOwn(agentScopes, agentId)) {
-        return null;
-    }
-    const values = agentScopes[agentId];
-    if (!Array.isArray(values) || values.length === 0 || values.length > 2 ||
-        values.some((value) => !isScope(value)) || new Set(values).size !== values.length) {
-        return null;
-    }
-    return [...values];
-}
-function validateParameters(raw, allowed) {
+function validateParameters(raw) {
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
-        throw new Error("knowledge_query parameters must be an object");
+        throw new Error("knowledge tool parameters must be an object");
     }
     const params = raw;
-    if (Object.keys(params).some((key) => !["query", "scopes", "top_k"].includes(key))) {
-        throw new Error("knowledge_query received an unknown parameter");
+    if (Object.keys(params).some((key) => key !== "query" && key !== "top_k")) {
+        throw new Error("knowledge tool received an unknown parameter");
     }
     if (typeof params.query !== "string" || !params.query.trim() ||
         Array.from(params.query).length > 4096) {
         throw new Error("query must contain 1 to 4096 Unicode characters");
     }
-    if (!Array.isArray(params.scopes) || params.scopes.length === 0 ||
-        params.scopes.some((scope) => !isScope(scope)) ||
-        new Set(params.scopes).size !== params.scopes.length) {
-        throw new Error("scopes must be a non-empty unique subset of chen and family");
-    }
-    if (params.scopes.some((scope) => !allowed.includes(scope))) {
-        throw new Error("requested scope is not authorized for this agent");
-    }
     const topK = params.top_k === undefined ? 5 : params.top_k;
     if (typeof topK !== "number" || !Number.isInteger(topK) || topK < 1 || topK > 10) {
         throw new Error("top_k must be an integer between 1 and 10");
     }
-    return { query: params.query, scopes: [...params.scopes], topK };
+    return { query: params.query, topK };
 }
-/** Exported for unit tests; the actual factory below supplies trusted agentId. */
-export function createKnowledgeTool(config, agentId) {
-    const allowed = allowedForAgent(config, agentId);
-    if (!allowed)
+/** The factory receives agentId from OpenClaw, never from model parameters. */
+export function createKnowledgeTool(kind, config, agentId) {
+    if (!capability(config, agentId, kind))
         return null;
+    const trustedAgentId = agentId;
+    const isPrivate = kind === "private";
     return {
-        name: "knowledge_query",
-        label: "Knowledge Query",
-        description: TOOL_DESCRIPTION,
-        parameters: parametersForScopes(allowed),
+        name: isPrivate ? "knowledge_private" : "knowledge_shared",
+        label: isPrivate ? "Private Knowledge" : "Shared Knowledge",
+        description: `${isPrivate ? "Query this agent's authorized private NAS knowledge." : "Query the authorized family-shared NAS knowledge."} ${CAUTION}`,
+        parameters: staticParameters,
         outputSchema: ragContextSchema,
         async execute(_toolCallId, rawParams, signal) {
-            // Recheck authorization at execution time; a model-facing schema is not a boundary.
-            const params = validateParameters(rawParams, allowed);
-            const result = await queryKnowledgeBase({ ...params, signal });
-            return {
-                content: [{ type: "text", text: JSON.stringify(result) }],
-                details: result,
-            };
+            const { query, topK } = validateParameters(rawParams);
+            const result = await queryBroker({ kind, agentId: trustedAgentId, query, topK, signal });
+            return { content: [{ type: "text", text: JSON.stringify(result) }], details: result };
         },
     };
 }
 export default defineToolPlugin({
     id: "local-knowledge-query",
     name: "Local Knowledge Query",
-    description: "Agent-scoped, read-only access to the local NAS RAG Context service.",
+    description: "Read-only private and family-shared NAS knowledge tools via the local policy broker.",
     configSchema,
-    tools: (tool) => [
-        tool({
-            name: "knowledge_query",
-            label: "Knowledge Query",
-            description: TOOL_DESCRIPTION,
-            parameters: staticParameters,
-            factory({ config, toolContext }) {
-                return createKnowledgeTool(config, toolContext.agentId);
-            },
-        }),
-    ],
+    tools: (tool) => ["private", "shared"].map((kind) => tool({
+        name: kind === "private" ? "knowledge_private" : "knowledge_shared",
+        label: kind === "private" ? "Private Knowledge" : "Shared Knowledge",
+        description: `${kind === "private" ? "Query this agent's authorized private NAS knowledge." : "Query the authorized family-shared NAS knowledge."} ${CAUTION}`,
+        parameters: staticParameters,
+        factory({ config, toolContext }) {
+            return createKnowledgeTool(kind, config, toolContext.agentId);
+        },
+    })),
 });

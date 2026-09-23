@@ -7,10 +7,10 @@ export type Scope = Static<typeof scopeSchema>;
 
 export const configSchema = Type.Object(
   {
-    agentScopes: Type.Record(
-      Type.String(),
-      Type.Array(scopeSchema, { minItems: 1, maxItems: 2, uniqueItems: true }),
-    ),
+    agents: Type.Record(Type.String(), Type.Object({
+      private: Type.Boolean(),
+      shared: Type.Boolean(),
+    }, { additionalProperties: false })),
   },
   { additionalProperties: false },
 );
@@ -58,23 +58,7 @@ export type RagContext = Static<typeof ragContextSchema>;
 export const staticParameters = Type.Object(
   {
     query: Type.String({ minLength: 1, maxLength: 4096 }),
-    scopes: Type.Array(scopeSchema, { minItems: 1, maxItems: 2, uniqueItems: true }),
     top_k: Type.Optional(Type.Integer({ minimum: 1, maximum: 10 })),
   },
   { additionalProperties: false },
 );
-
-export function parametersForScopes(allowed: readonly Scope[]) {
-  return Type.Object(
-    {
-      query: Type.String({ minLength: 1, maxLength: 4096 }),
-      scopes: Type.Array(Type.String({ enum: [...allowed] }), {
-        minItems: 1,
-        maxItems: allowed.length,
-        uniqueItems: true,
-      }),
-      top_k: Type.Optional(Type.Integer({ minimum: 1, maximum: 10 })),
-    },
-    { additionalProperties: false },
-  );
-}

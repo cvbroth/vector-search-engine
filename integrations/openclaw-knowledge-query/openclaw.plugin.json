@@ -1,34 +1,32 @@
 {
   "id": "local-knowledge-query",
   "name": "Local Knowledge Query",
-  "description": "Agent-scoped, read-only access to the local NAS RAG Context service.",
+  "description": "Read-only private and family-shared NAS knowledge tools via the local policy broker.",
   "version": "0.1.0",
   "configSchema": {
     "type": "object",
     "required": [
-      "agentScopes"
+      "agents"
     ],
     "properties": {
-      "agentScopes": {
+      "agents": {
         "type": "object",
         "patternProperties": {
           "^.*$": {
-            "type": "array",
-            "items": {
-              "anyOf": [
-                {
-                  "type": "string",
-                  "const": "chen"
-                },
-                {
-                  "type": "string",
-                  "const": "family"
-                }
-              ]
+            "type": "object",
+            "required": [
+              "private",
+              "shared"
+            ],
+            "properties": {
+              "private": {
+                "type": "boolean"
+              },
+              "shared": {
+                "type": "boolean"
+              }
             },
-            "minItems": 1,
-            "maxItems": 2,
-            "uniqueItems": true
+            "additionalProperties": false
           }
         }
       }
@@ -40,7 +38,8 @@
   },
   "contracts": {
     "tools": [
-      "knowledge_query"
+      "knowledge_private",
+      "knowledge_shared"
     ]
   }
 }

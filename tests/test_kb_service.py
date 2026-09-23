@@ -210,7 +210,7 @@ console.log(JSON.stringify({ options: request.options, body: JSON.parse(request.
             input=script.encode("utf-8"), capture_output=True, check=True,
         )
         payload = json.loads(completed.stdout.decode("utf-8"))
-        self.assertEqual(payload["options"]["socketPath"], "/run/knowledge-base/kb.sock")
+        self.assertEqual(payload["options"]["socketPath"], "/run/knowledge-base/backend.sock")
         self.assertEqual(payload["options"]["path"], "/v1/context")
         self.assertEqual(payload["options"]["method"], "POST")
         self.assertNotIn("hostname", payload["options"])

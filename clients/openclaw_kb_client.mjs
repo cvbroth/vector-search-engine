@@ -3,7 +3,7 @@ import http from "node:http";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
-const DEFAULT_SOCKET = "/run/knowledge-base/kb.sock";
+const DEFAULT_SOCKET = "/run/knowledge-base/backend.sock";
 const MAX_QUERY_CHARS = 4096;
 const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
 const ALLOWED_SCOPES = new Set(["chen", "family"]);

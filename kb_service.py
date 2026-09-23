@@ -21,7 +21,7 @@ from config import KNOWLEDGE_SCOPES, reject_symlink_components
 from embeddings import EmbeddingError
 from rag_context import SCHEMA_VERSION, build_rag_context
 
-DEFAULT_SOCKET_PATH = Path("/run/knowledge-base/kb.sock")
+DEFAULT_SOCKET_PATH = Path("/run/knowledge-base/backend.sock")
 DEFAULT_SOCKET_MODE = 0o660
 MAX_BODY_BYTES = 64 * 1024
 MAX_QUERY_CHARS = 4096

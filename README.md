@@ -14,8 +14,10 @@
 | `relevance.py` | 独立的三态检索判断函数；不做答案生成或事实核验 |
 | `rag_context.py` | 将现有门控检索结果转为稳定的机器可读 JSON 证据 |
 | `kb_service.py` | 仅通过宿主机 Unix socket 提供只读 RAG Context 查询接口 |
-| `clients/openclaw_kb_client.mjs` | Node.js Unix socket 查询客户端；不依赖容器内 Python |
-| `integrations/openclaw-knowledge-query/` | Agent 级 scope 授权的 OpenClaw `knowledge_query` Tool Plugin；直接使用 Unix socket |
+| `kb_policy_broker.py` | 宿主机中央授权 Broker；按 Agent 和工具类型解析 scope 并转发到查询后端 |
+| `examples/knowledge-broker-policy.json` | Broker policy 示例；真实 policy 应单独放在 `/etc/knowledge-broker/policy.json` |
+| `clients/openclaw_kb_client.mjs` | 仅供可信宿主机诊断的旧式直接查询客户端；不可作为 Agent 授权入口 |
+| `integrations/openclaw-knowledge-query/` | 仅提供 `knowledge_private` / `knowledge_shared` 的 OpenClaw Tool Plugin |
 | `calibrate_relevance.py` | 用人工标注查询记录单库 Top1 诊断分数，汇总并扫描候选阈值；不参与生产搜索 |
 
 ## 安装依赖
@@ -150,7 +152,7 @@ JSON schema `1.0` 的字段固定显式生成，例如：
 在支持 Unix socket 的宿主机上，可由已有的普通用户运行：
 
 ```bash
-python kb_service.py --socket /run/knowledge-base/kb.sock --socket-mode 0660
+python kb_service.py --socket /run/knowledge-base/backend.sock --socket-mode 0660
 ```
 
 唯一查询路由是 `POST /v1/context`，请求体为 UTF-8 JSON：
@@ -169,7 +171,7 @@ python kb_service.py --socket /run/knowledge-base/kb.sock --socket-mode 0660
 | Embedding 服务失败 | `503` | 错误对象；不能当作无证据 |
 | SQLite 或其他内部查询错误 | `500` | 错误对象；不能当作无证据 |
 
-Node.js 客户端通过 socket 发出固定的 `POST /v1/context`，stdout 只输出服务返回的 JSON；正常的 REJECT 仍以退出码 0 结束，参数/服务/协议错误写 stderr 并以非零退出。`--socket` 仅用于指定另一个**本地 Unix socket 路径**，不接受 HTTP URL：
+旧 Node.js 客户端通过 backend socket 发出固定的 `POST /v1/context`，stdout 只输出服务返回的 JSON；正常的 REJECT 仍以退出码 0 结束，参数/服务/协议错误写 stderr 并以非零退出。`--socket` 仅用于指定另一个**本地 Unix socket 路径**，不接受 HTTP URL。它仅供可信宿主机诊断，**不能放进 OpenClaw Agent 作为授权工具**：
 
 ```bash
 node clients/openclaw_kb_client.mjs --query "家庭共享服务器叫什么？" --scope family --top-k 5
@@ -187,7 +189,7 @@ After=network.target
 Type=simple
 User=chen
 WorkingDirectory=/opt/knowledge-base
-ExecStart=/opt/knowledge-base/.venv/bin/python /opt/knowledge-base/kb_service.py --socket /run/knowledge-base/kb.sock --socket-mode 0660
+ExecStart=/opt/knowledge-base/.venv/bin/python /opt/knowledge-base/kb_service.py --socket /run/knowledge-base/backend.sock --socket-mode 0660
 RuntimeDirectory=knowledge-base
 RuntimeDirectoryMode=0750
 Restart=on-failure
@@ -196,9 +198,19 @@ Restart=on-failure
 WantedBy=multi-user.target
 ```
 
-Unix socket 文件权限是本阶段唯一访问控制边界，没有额外身份系统。示例 `0660` 仅允许 owner 与所属 group 连接；目录 `0750` 还要求客户端能沿路径进入。实际接入容器前，需要根据宿主机 `chen`、共享 group、容器内 `node` 的 GID 和只读/可访问的 socket 目录挂载方式配置；不要用 `0777`。**任何能连接该 socket 的进程都可主动请求 `chen` 或 `family`，当前没有按 scope 的调用者授权。**因此只应向被信任的本地进程授予连接权限，尤其不能把它当作已经隔离 `chen` 私有数据的多租户接口。服务启动时仅清理已确认失效的旧 socket，拒绝覆盖普通文件、目录、符号链接或正在监听的 socket，并尽可能在退出时清理自己的 socket。
+Backend socket **没有 Agent 授权**，只能让 Broker 与可信宿主机诊断进程连接，不能挂载给 OpenClaw 容器。示例 `0660` 仅允许 owner/group 连接；目录 `0750` 也必须控制遍历权限。不要使用 `0777`。服务启动时仅清理已确认失效的旧 socket，并尽可能在退出时清理自己的 socket。上面的 systemd 示例只是后端示例，不表示服务器已迁移。
 
-OpenClaw Agent 使用的插件代码、`agentId`/`agentScopes` 授权示例和本地验证命令见 [`integrations/openclaw-knowledge-query/README.md`](integrations/openclaw-knowledge-query/README.md)。插件仅约束通过该工具发起的查询；它不能替代 Unix socket 的文件权限控制。仓库中的插件代码不代表已在 OpenClaw 容器安装或验证。
+## KB Policy Broker：Agent 到 scope 的中央映射
+
+Broker 是独立的宿主机本地 Unix socket 服务，固定监听 `/run/knowledge-broker/query.sock`，从 `/etc/knowledge-broker/policy.json` 读取 ACL，转发到 `/run/knowledge-base/backend.sock`。它不监听 TCP，也不直接检索数据库或修改索引。Broker 的 policy 示例见 [`examples/knowledge-broker-policy.json`](examples/knowledge-broker-policy.json)。实际服务器上的文件、目录、socket 权限和服务部署需单独规划；本仓库没有替用户操作服务器。
+
+Policy schema `1.0` 顶层只包含 `schema_version`、`shared_scope`（当前固定为已配置的 `family`）及 `agents`。每个 Agent 映射为 `{ "private_scope": "chen" | null, "shared": true | false }`。示例中 `main`、`chen` 的 private 都指向 `chen`；`liang`、`ziling` 的 private 为 `null`；四者的 shared 都指向 `family`。Agent ID 不写死在 Python 代码中。未知 Agent、缺失 policy、非法 schema、未知 scope 都 fail closed；未来只有当后端正式增加 `liang`/`ziling` 私库配置后，policy 才能把对应 `private_scope` 改为这些值，模型工具接口无需改变。
+
+Broker 只接受 `POST /v1/private-context` 或 `POST /v1/shared-context`，请求体为 `{"agent_id":"chen","query":"问题","top_k":5}`。前者用 policy 的该 Agent `private_scope`；后者先检查 `shared=true`，再用 policy `shared_scope`。由 Broker 而非模型生成后端的 `scopes=[...]`。`GET /health` 只返回状态与 schema 版本，不暴露 ACL/用户列表。请求字段严格限制为 `agent_id`、`query`、`top_k`；query 最多 4096 字符，top_k 为 1–10。授权失败返回 403，输入错误 400；正常无证据返回 200/REJECT/空 evidence；后端超时或故障返回 5xx，绝不伪装成 REJECT。
+
+Broker 为每次 POST 写结构化 audit：UTC 时间、UUID4 request_id、Agent ID、PRIVATE/SHARED、解析出的 scope、ALLOW/DENY/ERROR、retrieval_status、evidence_count、耗时，以及 Linux 支持时的 peer UID/GID/PID。默认仅记录 query 长度与 SHA-256 前缀，不记录完整 query、evidence 或 chunk。应将日志权限限制在可信管理员范围。
+
+OpenClaw 插件只请求 Broker socket，模型仅看到 `knowledge_private(query, top_k?)` 与 `knowledge_shared(query, top_k?)`；模型参数不含 Agent ID 或 scope。插件从可信 `toolContext.agentId` 注入身份，本地 `agents: {id: {private:boolean, shared:boolean}}` 只用于工具可见性/第一层防误调用，**Broker policy 是最终 ACL**。详见 [`integrations/openclaw-knowledge-query/README.md`](integrations/openclaw-knowledge-query/README.md)。同一个 Gateway/容器/Unix UID 中，拥有任意代码执行能力的 Agent 理论上仍可直连 Broker socket 并伪造 JSON 中的 `agent_id`；此设计不是密码学身份认证或强租户隔离。未来需要 per-agent sandbox、独立 UID/容器或 capability boundary。切勿宣称当前 Broker 能防任意代码执行攻击。
 
 ## 相关度标定
 

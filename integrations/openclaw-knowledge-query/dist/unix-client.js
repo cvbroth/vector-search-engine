@@ -1,42 +1,42 @@
-/** Fixed local Unix socket transport; no URL or socket-path input exists. */
+/** Fixed local broker transport. Neither socket path nor scope is caller supplied. */
 import http from "node:http";
 import Value from "typebox/value";
 import { ragContextSchema } from "./contracts.js";
-const SOCKET_PATH = "/run/knowledge-base/kb.sock";
-const REQUEST_PATH = "/v1/context";
+const SOCKET_PATH = "/run/knowledge-broker/query.sock";
 const TIMEOUT_MS = 10_000;
 const MAX_RESPONSE_BYTES = 1024 * 1024;
 function validateResponse(value, request) {
     if (!Value.Check(ragContextSchema, value)) {
-        throw new Error("knowledge service protocol error: invalid RAG Context schema");
+        throw new Error("knowledge broker protocol error: invalid RAG Context schema");
     }
     const context = value;
-    if (context.query !== request.query ||
-        context.scopes.length !== request.scopes.length ||
-        context.scopes.some((scope, index) => scope !== request.scopes[index]) ||
+    if (context.query !== request.query || context.scopes.length !== 1 ||
         context.evidence_count !== context.evidence.length ||
         context.evidence_count > request.topK ||
-        context.evidence.some((item, index) => item.rank !== index + 1 || !request.scopes.includes(item.scope))) {
-        throw new Error("knowledge service protocol error: response does not match request");
+        context.evidence.some((item, index) => item.rank !== index + 1 ||
+            item.scope !== context.scopes[0])) {
+        throw new Error("knowledge broker protocol error: response does not match request");
     }
     const hasAccept = context.evidence.some((item) => item.relevance_decision === "ACCEPT");
-    const expectedStatus = context.evidence_count === 0
-        ? "REJECT"
-        : hasAccept ? "ACCEPT" : "UNCERTAIN";
+    const expectedStatus = context.evidence_count === 0 ? "REJECT" :
+        hasAccept ? "ACCEPT" : "UNCERTAIN";
     if (context.retrieval_status !== expectedStatus) {
-        throw new Error("knowledge service protocol error: inconsistent retrieval status");
+        throw new Error("knowledge broker protocol error: inconsistent retrieval status");
     }
     return context;
 }
-export function queryKnowledgeBase(request) {
-    if (request.signal?.aborted) {
-        return Promise.reject(new Error("knowledge query aborted"));
+export function queryBroker(request) {
+    if (request.kind !== "private" && request.kind !== "shared") {
+        return Promise.reject(new Error("invalid knowledge access kind"));
     }
+    if (request.signal?.aborted)
+        return Promise.reject(new Error("knowledge query aborted"));
     const body = Buffer.from(JSON.stringify({
+        agent_id: request.agentId,
         query: request.query,
-        scopes: request.scopes,
         top_k: request.topK,
     }), "utf8");
+    const requestPath = request.kind === "private" ? "/v1/private-context" : "/v1/shared-context";
     return new Promise((resolve, reject) => {
         let settled = false;
         const finish = (error, value) => {
@@ -52,7 +52,7 @@ export function queryKnowledgeBase(request) {
         };
         const client = http.request({
             socketPath: SOCKET_PATH,
-            path: REQUEST_PATH,
+            path: requestPath,
             method: "POST",
             headers: {
                 "Content-Type": "application/json",
@@ -65,29 +65,28 @@ export function queryKnowledgeBase(request) {
             response.on("data", (part) => {
                 size += part.byteLength;
                 if (size > MAX_RESPONSE_BYTES) {
-                    client.destroy(new Error("knowledge service response exceeds 1 MiB"));
+                    client.destroy(new Error("knowledge broker response exceeds 1 MiB"));
                     return;
                 }
                 parts.push(part);
             });
             response.on("error", (error) => finish(error));
-            response.on("aborted", () => finish(new Error("knowledge service response aborted")));
+            response.on("aborted", () => finish(new Error("knowledge broker response aborted")));
             response.on("end", () => {
                 if (settled)
                     return;
                 if (response.statusCode !== 200) {
-                    const category = response.statusCode && response.statusCode >= 500
-                        ? "service failure" : "request or protocol failure";
-                    finish(new Error(`knowledge ${category}: HTTP ${response.statusCode ?? "unknown"}`));
+                    const category = response.statusCode === 403 ? "authorization denied" :
+                        response.statusCode && response.statusCode >= 500 ? "service failure" :
+                            "request or protocol failure";
+                    finish(new Error(`knowledge broker ${category}: HTTP ${response.statusCode ?? "unknown"}`));
                     return;
                 }
-                let value;
                 try {
-                    value = JSON.parse(Buffer.concat(parts, size).toString("utf8"));
-                    finish(undefined, validateResponse(value, request));
+                    finish(undefined, validateResponse(JSON.parse(Buffer.concat(parts, size).toString("utf8")), request));
                 }
                 catch (error) {
-                    finish(error instanceof Error ? error : new Error("knowledge service protocol error"));
+                    finish(error instanceof Error ? error : new Error("knowledge broker protocol error"));
                 }
             });
         });
