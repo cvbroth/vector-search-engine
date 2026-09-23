@@ -41,6 +41,7 @@ class SearchResult:
     semantic_score: float | None = None
     lexical_match: bool = False
     lexical_score: float | None = None
+    text: str = ""
 
     @property
     def relevance_decision(self) -> RelevanceDecision:
@@ -236,6 +237,7 @@ def search_scope(
             semantic_score=hit.semantic_score,
             lexical_match=hit.lexical_match,
             lexical_score=hit.lexical_score,
+            text=str(hit.row["text"]),
         )
         for rank, hit in enumerate(hits, start=1)
     ]
@@ -281,6 +283,7 @@ def search_scopes(
             semantic_score=hit.semantic_score,
             lexical_match=hit.lexical_match,
             lexical_score=hit.lexical_score,
+            text=str(hit.row["text"]),
         )
         for global_rank, (local_rank, _, name, hit) in enumerate(
             candidates[:top_k], start=1

@@ -12,6 +12,7 @@
 | `ingest.py` | 仅扫描选定 scope，新增、跳过、重建或清理该库索引 |
 | `search.py` | 单库 FTS5 + 语义检索 RRF；另提供多库 `search_scopes()` API |
 | `relevance.py` | 独立的三态检索判断函数；不做答案生成或事实核验 |
+| `rag_context.py` | 将现有门控检索结果转为稳定的机器可读 JSON 证据 |
 | `calibrate_relevance.py` | 用人工标注查询记录单库 Top1 诊断分数，汇总并扫描候选阈值；不参与生产搜索 |
 
 ## 安装依赖
@@ -49,7 +50,7 @@ from search import search_scopes
 results = search_scopes("问题", ["chen", "family"], 5)
 ```
 
-返回 `SearchResult` 列表，保留原有的 `scope`、全局 `rank`、`fused_score`、`source_path`、`filename`、`page`、`chunk_index`、`snippet`，并增加 `semantic_distance`、`semantic_score`、`lexical_match`、`lexical_score` 诊断字段。每个数据库先独立执行原有 Hybrid Search，再按各库内名次做第二层 RRF；同名次按调用者给出的 scope 顺序稳定排序，不比较跨库的原始 BM25 分数、向量距离或库内融合分数。请求的任一数据库不存在或查询失败时会抛出异常，不会静默返回不完整的多库结果。
+返回 `SearchResult` 列表，保留原有的 `scope`、全局 `rank`、`fused_score`、`source_path`、`filename`、`page`、`chunk_index`、`snippet`，并增加 `semantic_distance`、`semantic_score`、`lexical_match`、`lexical_score` 诊断字段及完整 `text`。每个数据库先独立执行原有 Hybrid Search，再按各库内名次做第二层 RRF；同名次按调用者给出的 scope 顺序稳定排序，不比较跨库的原始 BM25 分数、向量距离或库内融合分数。请求的任一数据库不存在或查询失败时会抛出异常，不会静默返回不完整的多库结果。
 
 ## 相关度诊断
 
@@ -86,6 +87,58 @@ python search.py "问题" --scope family --relevance-gate --debug-scores
 默认关闭门控，原有候选与 RRF 排序及输出保持不变。开启 `--relevance-gate` 后，仅在既有 Top-K 排序**之后**隐藏 `REJECT`，保留 `UNCERTAIN` / `ACCEPT` 并显示 decision；不会回填更多候选。保留结果按原顺序重新编号，原 RRF 分数不变。`--debug-scores` 无论是否开启门控都会显示语义分数、距离、FTS 诊断和 decision。
 
 Python API 的 `search_scope()` 与 `search_scopes()` 结果均可读取 `result.relevance_decision`；默认不会过滤。需要过滤时显式传入 `relevance_gate=True`，例如 `search_scopes("问题", ["chen", "family"], 5, relevance_gate=True)`。`classify_relevance(score)` 是独立纯函数，可用显式 `reject_threshold`、`accept_threshold` 参数进行离线试验；这不会修改正在运行的默认搜索配置。
+
+## RAG Context
+
+`rag_context.py` 复用现有单库 `search_scope()` / 多库 `search_scopes()` 和 Retrieval Gate，不重新实现 Embedding、FTS、向量检索或 RRF。调用者明确列出的 scope 才会被查询；单独指定 `chen` 不会自动访问 `family`，反之亦然。默认启用门控：REJECT 候选不进入 `evidence`，UNCERTAIN 和 ACCEPT 保留。
+
+```bash
+python rag_context.py "家庭共享服务器的测试代号是什么？" --scope family
+python rag_context.py "服务器测试代号是什么？" --scope chen --scope family --top-k 5
+python rag_context.py "服务器测试代号是什么？" --scope family --output context.json
+```
+
+正常查询时，CLI 的 stdout 只输出 JSON，不混入 INFO 日志或人类说明；`--output` 会另外写入同一份 UTF-8 JSON 文件。错误消息写 stderr。正常检索成功但没有证据时，仍输出 `retrieval_status="REJECT"`、空 `evidence` 并以退出码 0 结束；数据库、配置、Embedding、非法 scope 或 JSON 序列化错误则以非零状态结束，**不会伪装成 REJECT**。
+
+Python API：
+
+```python
+from rag_context import build_rag_context
+
+context = build_rag_context("服务器测试代号是什么？", ["chen", "family"], top_k=5)
+payload = context.to_dict()  # 可直接 json.dumps(payload, ensure_ascii=False)
+```
+
+JSON schema `1.0` 的字段固定显式生成，例如：
+
+```json
+{
+  "schema_version": "1.0",
+  "query": "家庭共享服务器的测试代号是什么？",
+  "scopes": ["family"],
+  "retrieval_status": "ACCEPT",
+  "evidence_count": 1,
+  "evidence": [
+    {
+      "scope": "family",
+      "rank": 1,
+      "fused_score": 0.032787,
+      "semantic_score": 0.759152,
+      "semantic_distance": 0.240848,
+      "lexical_match": true,
+      "lexical_score": -0.000012,
+      "relevance_decision": "ACCEPT",
+      "source_path": "/srv/storage/knowledge/shared/family/family_test.md",
+      "filename": "family_test.md",
+      "page": null,
+      "chunk_index": 0,
+      "text": "这里是完整的 chunk 文本，不是 280 字摘要。"
+    }
+  ]
+}
+```
+
+`text` 直接来自检索时已读取的完整 `chunks.text`；现有 `search.py` 终端输出仍只显示 `snippet`。顶层 `retrieval_status` 只表示**检索阶段状态**：没有门控后的结果为 REJECT；有结果且最高仅为 UNCERTAIN 则为 UNCERTAIN；至少一个 ACCEPT 则为 ACCEPT。UNCERTAIN 保留给未来的 Answerability Judge 检查。ACCEPT 只表示有较强语义候选，**不等于 answerable，更不允许直接编答案**。当前项目尚未实现 Judge、LLM 调用或自动回答。
 
 ## 相关度标定
 

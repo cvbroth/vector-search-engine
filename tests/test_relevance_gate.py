@@ -109,6 +109,30 @@ class RelevanceGateTests(unittest.TestCase):
         self.assertEqual([item.filename for item in gated], ["uncertain.md"])
         self.assertEqual(gated[0].rank, 1)
 
+    def test_search_results_keep_full_text_without_expanding_cli_snippet(self) -> None:
+        full_text = "甲" * 400
+        hit = make_hit("long.md", 0.7, 4)
+        hit.row["text"] = full_text
+        with (
+            patch.object(search, "connect_database", return_value=self.connection),
+            patch.object(search, "_hybrid_hits", return_value=[hit]),
+        ):
+            single = search.search_scope("question", "family", 1)
+            multi = search.search_scopes("question", ["family"], 1)
+        self.assertEqual(single[0].text, full_text)
+        self.assertEqual(multi[0].text, full_text)
+        self.assertEqual(len(single[0].snippet), 280)
+
+        with (
+            patch.object(search, "_hybrid_hits", return_value=[hit]),
+            patch.object(search, "connect_database", return_value=self.connection),
+            patch.object(search, "configure_logging"),
+            patch.object(sys, "argv", ["search.py", "question", "--scope", "family"]),
+            redirect_stdout(io.StringIO()) as output,
+        ):
+            self.assertEqual(search.main(), 0)
+        self.assertNotIn(full_text, output.getvalue())
+
     def _cli_output(self, *flags: str) -> str:
         with (
             patch.object(sys, "argv", ["search.py", "question", "--scope", "family", *flags]),
