@@ -18,6 +18,14 @@ if TYPE_CHECKING:
     from search import SearchResult
 
 SCHEMA_VERSION = "1.0"
+RAG_OVERFETCH_FACTOR = 5
+RAG_MIN_CANDIDATES = 20
+RAG_MAX_CANDIDATES = 50  # search_scope/search_scopes currently cap top_k at 50
+
+
+def _retrieval_k(top_k: int) -> int:
+    """Request extra candidates before the existing gate, within search's limit."""
+    return min(RAG_MAX_CANDIDATES, max(top_k * RAG_OVERFETCH_FACTOR, RAG_MIN_CANDIDATES))
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,8 +108,8 @@ def build_rag_context(
     """Reuse scoped search and its gate; status is retrieval-only, not answerability."""
     if not isinstance(query, str) or not query.strip():
         raise ValueError("query must not be empty")
-    if type(top_k) is not int or not 1 <= top_k <= 50:
-        raise ValueError("top-k must be between 1 and 50")
+    if type(top_k) is not int or not 1 <= top_k <= RAG_MAX_CANDIDATES:
+        raise ValueError(f"top-k must be between 1 and {RAG_MAX_CANDIDATES}")
     if not isinstance(scopes, list) or not scopes:
         raise ValueError("scopes must be a non-empty list")
     selected = [get_scope(name).name for name in scopes]
@@ -112,12 +120,13 @@ def build_rag_context(
     # sqlite-vec and document-parser packages.
     from search import search_scope, search_scopes
 
+    retrieval_k = _retrieval_k(top_k)
     if len(selected) == 1:
-        results = search_scope(query, selected[0], top_k, relevance_gate=True)
+        results = search_scope(query, selected[0], retrieval_k, relevance_gate=True)
     else:
-        results = search_scopes(query, selected, top_k, relevance_gate=True)
+        results = search_scopes(query, selected, retrieval_k, relevance_gate=True)
 
-    evidence = tuple(RagEvidence.from_search_result(result) for result in results)
+    evidence = tuple(RagEvidence.from_search_result(result) for result in results[:top_k])
     if not evidence:
         status = RelevanceDecision.REJECT
     elif any(item.relevance_decision is RelevanceDecision.ACCEPT for item in evidence):
@@ -134,7 +143,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--scope", action="append", choices=KNOWLEDGE_SCOPES, required=True,
         help="scope to search; repeat for an explicit multi-scope search",
     )
-    parser.add_argument("--top-k", type=int, default=5, help="results to keep (1-50)")
+    parser.add_argument(
+        "--top-k", type=int, default=5,
+        help=f"final evidence to keep (1-{RAG_MAX_CANDIDATES})",
+    )
     parser.add_argument("--output", type=Path, help="also write the JSON to this file")
     args = parser.parse_args(argv)
 

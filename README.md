@@ -90,7 +90,7 @@ Python API 的 `search_scope()` 与 `search_scopes()` 结果均可读取 `result
 
 ## RAG Context
 
-`rag_context.py` 复用现有单库 `search_scope()` / 多库 `search_scopes()` 和 Retrieval Gate，不重新实现 Embedding、FTS、向量检索或 RRF。调用者明确列出的 scope 才会被查询；单独指定 `chen` 不会自动访问 `family`，反之亦然。默认启用门控：REJECT 候选不进入 `evidence`，UNCERTAIN 和 ACCEPT 保留。
+`rag_context.py` 复用现有单库 `search_scope()` / 多库 `search_scopes()` 和 Retrieval Gate，不重新实现 Embedding、FTS、向量检索或 RRF。调用者明确列出的 scope 才会被查询；单独指定 `chen` 不会自动访问 `family`，反之亦然。默认启用门控：REJECT 候选不进入 `evidence`，UNCERTAIN 和 ACCEPT 保留。这里的 `top_k` 表示**门控后的最终 evidence 上限**：RAG Context 会在现有搜索允许的 50 条范围内有限 overfetch，再把门控后的结果截取为最多 `top_k` 条。这样可降低前几名全被拒绝导致的 false REJECT，但不能保证绝对召回；它不改变 `search.py` 的默认搜索行为。
 
 ```bash
 python rag_context.py "家庭共享服务器的测试代号是什么？" --scope family

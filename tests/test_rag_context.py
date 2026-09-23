@@ -14,7 +14,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from rag_context import build_rag_context, main
+from rag_context import _retrieval_k, build_rag_context, main
 from relevance import RelevanceDecision
 
 
@@ -55,13 +55,62 @@ def fake_search_module(
 
 
 class RagContextTests(unittest.TestCase):
+    def test_overfetch_bounds(self) -> None:
+        self.assertEqual(_retrieval_k(1), 20)
+        self.assertEqual(_retrieval_k(3), 20)
+        self.assertEqual(_retrieval_k(5), 25)
+        self.assertEqual(_retrieval_k(10), 50)
+        self.assertEqual(_retrieval_k(50), 50)
+
+    def test_overfetch_recovers_accept_beyond_rejected_top_three(self) -> None:
+        raw = [
+            fake_result(decision=RelevanceDecision.REJECT) for _ in range(3)
+        ] + [fake_result(decision=RelevanceDecision.ACCEPT, text="fourth candidate")]
+        module = fake_search_module()
+
+        def gated_search(query: str, scope: str, candidate_k: int, *, relevance_gate: bool):
+            self.assertTrue(relevance_gate)
+            return [
+                item for item in raw[:candidate_k]
+                if item.relevance_decision is not RelevanceDecision.REJECT
+            ]
+
+        module.search_scope.side_effect = gated_search
+        with patch.dict(sys.modules, {"search": module}):
+            context = build_rag_context("测试代号？", ["family"], top_k=3)
+        module.search_scope.assert_called_once_with(
+            "测试代号？", "family", 20, relevance_gate=True
+        )
+        self.assertIs(context.retrieval_status, RelevanceDecision.ACCEPT)
+        self.assertEqual(context.evidence_count, 1)
+        self.assertEqual(context.evidence[0].text, "fourth candidate")
+
+    def test_final_evidence_count_never_exceeds_requested_top_k(self) -> None:
+        candidates = [fake_result(text=f"chunk {i}") for i in range(20)]
+        module = fake_search_module(single=candidates, multi=candidates)
+        with patch.dict(sys.modules, {"search": module}):
+            single = build_rag_context("问题", ["family"], top_k=3)
+            multi = build_rag_context("问题", ["chen", "family"], top_k=3)
+        self.assertEqual(single.evidence_count, 3)
+        self.assertEqual(multi.evidence_count, 3)
+        self.assertLessEqual(single.to_dict()["evidence_count"], 3)
+        self.assertLessEqual(multi.to_dict()["evidence_count"], 3)
+        self.assertEqual([item.text for item in single.evidence],
+                         ["chunk 0", "chunk 1", "chunk 2"])
+        self.assertEqual([item.text for item in multi.evidence],
+                         ["chunk 0", "chunk 1", "chunk 2"])
+        module.search_scope.assert_called_once_with("问题", "family", 20, relevance_gate=True)
+        module.search_scopes.assert_called_once_with(
+            "问题", ["chen", "family"], 20, relevance_gate=True
+        )
+
     def test_single_scope_accept_and_full_chunk_text(self) -> None:
         full_text = "完整证据" * 100
         module = fake_search_module(single=[fake_result(text=full_text)])
         with patch.dict(sys.modules, {"search": module}):
             context = build_rag_context("测试代号是什么？", ["family"], 5)
         module.search_scope.assert_called_once_with(
-            "测试代号是什么？", "family", 5, relevance_gate=True
+            "测试代号是什么？", "family", 25, relevance_gate=True
         )
         module.search_scopes.assert_not_called()
         self.assertIs(context.retrieval_status, RelevanceDecision.ACCEPT)
@@ -87,7 +136,7 @@ class RagContextTests(unittest.TestCase):
         module = fake_search_module(single=[fake_result(scope="chen")])
         with patch.dict(sys.modules, {"search": module}):
             context = build_rag_context("问题", ["chen"])
-        module.search_scope.assert_called_once_with("问题", "chen", 5, relevance_gate=True)
+        module.search_scope.assert_called_once_with("问题", "chen", 25, relevance_gate=True)
         module.search_scopes.assert_not_called()
         self.assertEqual(context.to_dict()["scopes"], ["chen"])
 
@@ -105,6 +154,9 @@ class RagContextTests(unittest.TestCase):
         self.assertEqual(payload["retrieval_status"], "REJECT")
         self.assertEqual(payload["evidence_count"], 0)
         self.assertEqual(payload["evidence"], [])
+        module.search_scope.assert_called_once_with(
+            "未知问题", "family", 25, relevance_gate=True
+        )
 
     def test_explicit_multi_scope_uses_existing_fusion_api(self) -> None:
         module = fake_search_module(
@@ -114,7 +166,7 @@ class RagContextTests(unittest.TestCase):
         with patch.dict(sys.modules, {"search": module}):
             context = build_rag_context("测试代号？", ["chen", "family"], 2)
         module.search_scopes.assert_called_once_with(
-            "测试代号？", ["chen", "family"], 2, relevance_gate=True
+            "测试代号？", ["chen", "family"], 20, relevance_gate=True
         )
         module.search_scope.assert_not_called()
         self.assertEqual(context.to_dict()["scopes"], ["chen", "family"])
