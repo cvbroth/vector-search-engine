@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import stat
 from dataclasses import dataclass
 from pathlib import Path
@@ -52,9 +53,34 @@ EMBEDDING_DIMENSION = 768
 EMBEDDING_BATCH_SIZE = 16
 EMBEDDING_TIMEOUT_SECONDS = 45
 
+# Provisional values from a small labeled calibration set; not answerability proof.
+RELEVANCE_REJECT_THRESHOLD = 0.55
+RELEVANCE_ACCEPT_THRESHOLD = 0.64
+
 CHUNK_MAX_CHARS = 1200
 CHUNK_OVERLAP_CHARS = 160
 SUPPORTED_SUFFIXES = frozenset({".md", ".txt", ".pdf", ".docx"})
+
+
+def validate_relevance_thresholds(reject: float, accept: float) -> None:
+    """Reject invalid or reversed cosine-similarity decision boundaries."""
+    if type(reject) not in (int, float) or type(accept) not in (int, float):
+        raise ValueError("relevance thresholds must satisfy -1 <= reject < accept <= 1")
+    try:
+        valid = (
+            math.isfinite(reject)
+            and math.isfinite(accept)
+            and -1.0 <= reject < accept <= 1.0
+        )
+    except OverflowError:
+        valid = False
+    if not valid:
+        raise ValueError("relevance thresholds must satisfy -1 <= reject < accept <= 1")
+
+
+validate_relevance_thresholds(
+    RELEVANCE_REJECT_THRESHOLD, RELEVANCE_ACCEPT_THRESHOLD
+)
 
 
 def get_scope(name: str) -> KnowledgeScope:

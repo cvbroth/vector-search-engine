@@ -11,6 +11,7 @@
 | `database.py` | 建立 SQLite、FTS5、sqlite-vec 表；事务式写入与删除 |
 | `ingest.py` | 仅扫描选定 scope，新增、跳过、重建或清理该库索引 |
 | `search.py` | 单库 FTS5 + 语义检索 RRF；另提供多库 `search_scopes()` API |
+| `relevance.py` | 独立的三态检索判断函数；不做答案生成或事实核验 |
 | `calibrate_relevance.py` | 用人工标注查询记录单库 Top1 诊断分数，汇总并扫描候选阈值；不参与生产搜索 |
 
 ## 安装依赖
@@ -62,7 +63,29 @@ results = search_scopes("问题", ["chen", "family"], 5)
 python search.py "赤狐星云" --scope family --debug-scores
 ```
 
-当前只提供诊断数据，**尚未启用无关查询过滤或拒答阈值**。后续应先收集相关与无关查询的实测分数分布，再决定 relevance gate；无关查询现在仍可能有语义 Top-K 结果。
+默认仍只提供诊断数据，不启用过滤；无关查询仍可能有语义 Top-K 结果。可显式启用下面的暂定检索门控，但它不判断文档是否真正能回答问题。
+
+## 暂定 Retrieval Gate
+
+两个 provisional 阈值集中定义在 `config.py`，并校验 `reject < accept`。它们来自当前少量标定样本，未来应继续重标定，不应视为通用或生产级 answerability 阈值：
+
+| Top1/候选 `semantic_score` | `RelevanceDecision` | 含义 |
+| --- | --- | --- |
+| `< 0.55` | `REJECT` | 当前 embedding 证据明显不足 |
+| `0.55` 至 `< 0.64` | `UNCERTAIN` | 主题可能相关，但不能证明文档能回答；未来可交给 answerability judge |
+| `>= 0.64` | `ACCEPT` | 语义相关度较高，但事实答案仍可能不存在 |
+
+缺少语义分数时保守标为 `UNCERTAIN`。`lexical_match` 和 RRF `fused_score` **不参与三态判断**；词面命中不能把结果自动升级为 `ACCEPT`。尤其 `ACCEPT` 绝不表示“可以直接编答案”。当前没有 LLM、reranker、自动回答或事实核验。
+
+```bash
+python search.py "家庭服务器的公网 IP 是什么？" --scope family --debug-scores
+python search.py "问题" --scope family --relevance-gate
+python search.py "问题" --scope family --relevance-gate --debug-scores
+```
+
+默认关闭门控，原有候选与 RRF 排序及输出保持不变。开启 `--relevance-gate` 后，仅在既有 Top-K 排序**之后**隐藏 `REJECT`，保留 `UNCERTAIN` / `ACCEPT` 并显示 decision；不会回填更多候选。保留结果按原顺序重新编号，原 RRF 分数不变。`--debug-scores` 无论是否开启门控都会显示语义分数、距离、FTS 诊断和 decision。
+
+Python API 的 `search_scope()` 与 `search_scopes()` 结果均可读取 `result.relevance_decision`；默认不会过滤。需要过滤时显式传入 `relevance_gate=True`，例如 `search_scopes("问题", ["chen", "family"], 5, relevance_gate=True)`。`classify_relevance(score)` 是独立纯函数，可用显式 `reject_threshold`、`accept_threshold` 参数进行离线试验；这不会修改正在运行的默认搜索配置。
 
 ## 相关度标定
 

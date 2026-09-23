@@ -8,7 +8,7 @@ import re
 import sqlite3
 import struct
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from config import (
@@ -21,6 +21,7 @@ from config import (
 )
 from database import connect_database
 from embeddings import EmbeddingError, embed_texts
+from relevance import RelevanceDecision, classify_relevance
 
 LOGGER = logging.getLogger("knowledge.search")
 RRF_K = 60
@@ -40,6 +41,10 @@ class SearchResult:
     semantic_score: float | None = None
     lexical_match: bool = False
     lexical_score: float | None = None
+
+    @property
+    def relevance_decision(self) -> RelevanceDecision:
+        return classify_relevance(self.semantic_score)
 
 
 @dataclass(frozen=True, slots=True)
@@ -198,7 +203,18 @@ def hybrid_search(
     ]
 
 
-def search_scope(query: str, scope_name: str, top_k: int = 5) -> list[SearchResult]:
+def _apply_relevance_gate(results: list[SearchResult]) -> list[SearchResult]:
+    """Filter only after ranking; keep remaining order and original RRF scores."""
+    kept = [
+        result for result in results
+        if result.relevance_decision is not RelevanceDecision.REJECT
+    ]
+    return [replace(result, rank=rank) for rank, result in enumerate(kept, start=1)]
+
+
+def search_scope(
+    query: str, scope_name: str, top_k: int = 5, *, relevance_gate: bool = False
+) -> list[SearchResult]:
     """Return one database's hybrid results with their original RRF scores."""
     scope = get_scope(scope_name)
     connection = connect_database(scope, create=False)
@@ -206,7 +222,7 @@ def search_scope(query: str, scope_name: str, top_k: int = 5) -> list[SearchResu
         hits = _hybrid_hits(connection, query, top_k, scope)
     finally:
         connection.close()
-    return [
+    results = [
         SearchResult(
             scope=scope.name,
             rank=rank,
@@ -223,9 +239,12 @@ def search_scope(query: str, scope_name: str, top_k: int = 5) -> list[SearchResu
         )
         for rank, hit in enumerate(hits, start=1)
     ]
+    return _apply_relevance_gate(results) if relevance_gate else results
 
 
-def search_scopes(query: str, scopes: list[str], top_k: int) -> list[SearchResult]:
+def search_scopes(
+    query: str, scopes: list[str], top_k: int, *, relevance_gate: bool = False
+) -> list[SearchResult]:
     """Fuse per-database hybrid rankings without comparing their raw scores."""
     if not query.strip():
         raise ValueError("question must not be empty")
@@ -248,7 +267,7 @@ def search_scopes(query: str, scopes: list[str], top_k: int) -> list[SearchResul
     # Every database contributes one ranked list. Equal ranks use the caller's
     # scope order, then the chunk ID, so results are deterministic.
     candidates.sort(key=lambda item: (item[0], item[1], int(item[3].row["id"])))
-    return [
+    results = [
         SearchResult(
             scope=name,
             rank=global_rank,
@@ -267,6 +286,7 @@ def search_scopes(query: str, scopes: list[str], top_k: int) -> list[SearchResul
             candidates[:top_k], start=1
         )
     ]
+    return _apply_relevance_gate(results) if relevance_gate else results
 
 
 def main() -> int:
@@ -276,6 +296,10 @@ def main() -> int:
     parser.add_argument(
         "--debug-scores", action="store_true",
         help="show raw cosine distance/similarity and FTS5 BM25 diagnostics",
+    )
+    parser.add_argument(
+        "--relevance-gate", action="store_true",
+        help="hide provisional REJECT results; retain UNCERTAIN and ACCEPT",
     )
     parser.add_argument(
         "--scope", choices=KNOWLEDGE_SCOPES, default=DEFAULT_SCOPE,
@@ -298,6 +322,11 @@ def main() -> int:
         LOGGER.error("search failed: %s", exc)
         return 1
 
+    if args.relevance_gate:
+        results = [
+            hit for hit in results
+            if classify_relevance(hit.semantic_score) is not RelevanceDecision.REJECT
+        ]
     if not results:
         print("No results.")
         return 0
@@ -332,7 +361,10 @@ def main() -> int:
                 f"semantic score (cosine similarity): {similarity}\n"
                 f"lexical match (FTS top-N): {hit.lexical_match}\n"
                 f"lexical score (FTS5 BM25): {lexical_score}\n"
+                f"relevance decision: {classify_relevance(hit.semantic_score).value}\n"
             )
+        elif args.relevance_gate:
+            print(f"relevance decision: {classify_relevance(hit.semantic_score).value}\n")
     return 0
 
 
