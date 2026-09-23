@@ -1,7 +1,8 @@
-"""Incrementally index only /srv/storage/knowledge/private/chen."""
+"""Incrementally index one explicitly selected knowledge scope."""
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import logging
 import os
@@ -12,7 +13,15 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from chunker import chunk_blocks
-from config import SOURCE_ROOT, SUPPORTED_SUFFIXES, configure_logging
+from config import (
+    DEFAULT_SCOPE,
+    KNOWLEDGE_SCOPES,
+    SUPPORTED_SUFFIXES,
+    KnowledgeScope,
+    configure_logging,
+    get_scope,
+    reject_symlink_components,
+)
 from database import (
     connect_database,
     delete_document,
@@ -35,17 +44,19 @@ class Snapshot:
     sha256: str
 
 
-def discover_source_files() -> list[Path]:
+def discover_source_files(scope: KnowledgeScope) -> list[Path]:
     """Complete scan or error; never follow symlink directories or files."""
-    if not SOURCE_ROOT.is_dir() or SOURCE_ROOT.resolve(strict=True) != SOURCE_ROOT:
-        raise OSError(f"source root is missing or redirects elsewhere: {SOURCE_ROOT}")
+    source_root = scope.source_dir
+    reject_symlink_components(source_root)
+    if not source_root.is_dir():
+        raise OSError(f"source root is missing: {source_root}")
     found: list[Path] = []
 
     def fail(error: OSError) -> None:
         raise error
 
     for directory, subdirs, filenames in os.walk(
-        SOURCE_ROOT, topdown=True, followlinks=False, onerror=fail
+        source_root, topdown=True, followlinks=False, onerror=fail
     ):
         parent = Path(directory)
         subdirs[:] = [name for name in subdirs if not (parent / name).is_symlink()]
@@ -56,13 +67,15 @@ def discover_source_files() -> list[Path]:
     return sorted(found)
 
 
-def read_snapshot(path: Path) -> Snapshot:
+def read_snapshot(path: Path, scope: KnowledgeScope) -> Snapshot:
     """Open each path component relative to the fixed root without following links."""
-    relative = path.relative_to(SOURCE_ROOT)
+    source_root = scope.source_dir
+    reject_symlink_components(source_root)
+    relative = path.relative_to(source_root)
     if not relative.parts or any(part in (".", "..") for part in relative.parts):
         raise OSError(f"invalid source path: {path}")
     directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-    fd = os.open(SOURCE_ROOT, directory_flags)
+    fd = os.open(source_root, directory_flags)
     try:
         for part in relative.parts[:-1]:
             next_fd = os.open(part, directory_flags, dir_fd=fd)
@@ -88,8 +101,8 @@ def read_snapshot(path: Path) -> Snapshot:
     return Snapshot(data, after.st_size, after.st_mtime_ns, hashlib.sha256(data).hexdigest())
 
 
-def ingest_one(connection: sqlite3.Connection, path: Path) -> str:
-    snapshot = read_snapshot(path)
+def ingest_one(connection: sqlite3.Connection, path: Path, scope: KnowledgeScope) -> str:
+    snapshot = read_snapshot(path, scope)
     source_path = str(path)
     existing = get_document(connection, source_path)
     if existing and (
@@ -121,21 +134,28 @@ def ingest_one(connection: sqlite3.Connection, path: Path) -> str:
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description="Index a local knowledge scope")
+    parser.add_argument(
+        "--scope", choices=KNOWLEDGE_SCOPES, default=DEFAULT_SCOPE,
+        help="knowledge scope (default: chen)",
+    )
+    args = parser.parse_args()
+    scope = get_scope(args.scope)
     try:
-        configure_logging("ingest.log")
-    except OSError as exc:
-        print(f"cannot open private log directory: {exc}", file=sys.stderr)
+        configure_logging(scope, "ingest.log")
+    except (OSError, ValueError) as exc:
+        print(f"cannot open log directory: {exc}", file=sys.stderr)
         return 1
     try:
-        files = discover_source_files()
-        connection = connect_database(create=True)
+        files = discover_source_files(scope)
+        connection = connect_database(scope, create=True)
         try:
             initialize_schema(connection)
             seen = {str(path) for path in files}
             counts = {"added": 0, "updated": 0, "skipped": 0, "deleted": 0, "failed": 0}
             for path in files:
                 try:
-                    status = ingest_one(connection, path)
+                    status = ingest_one(connection, path, scope)
                     counts[status] += 1
                     LOGGER.info("%s: %s", status, path)
                 except (OSError, ParseError, EmbeddingError, sqlite3.Error, ValueError) as exc:

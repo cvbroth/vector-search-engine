@@ -10,17 +10,20 @@ from datetime import datetime, timezone
 import sqlite_vec
 
 from chunker import Chunk
-from config import DATABASE_PATH, EMBEDDING_DIMENSION
+from config import EMBEDDING_DIMENSION, KnowledgeScope, reject_symlink_components
 
 
-def connect_database(*, create: bool) -> sqlite3.Connection:
+def connect_database(scope: KnowledgeScope, *, create: bool) -> sqlite3.Connection:
+    database_path = scope.database_path
+    reject_symlink_components(database_path)
     if create:
-        DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        target = str(DATABASE_PATH)
+        database_path.parent.mkdir(parents=True, exist_ok=True)
+        reject_symlink_components(database_path)
+        target = str(database_path)
     else:
-        if not DATABASE_PATH.is_file():
-            raise FileNotFoundError(f"index does not exist: {DATABASE_PATH}")
-        target = DATABASE_PATH.as_uri() + "?mode=ro"
+        if not database_path.is_file():
+            raise FileNotFoundError(f"index does not exist: {database_path}")
+        target = database_path.as_uri() + "?mode=ro"
     connection = sqlite3.connect(target, uri=not create, isolation_level=None)
     try:
         connection.row_factory = sqlite3.Row
