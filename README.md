@@ -13,6 +13,8 @@
 | `search.py` | 单库 FTS5 + 语义检索 RRF；另提供多库 `search_scopes()` API |
 | `relevance.py` | 独立的三态检索判断函数；不做答案生成或事实核验 |
 | `rag_context.py` | 将现有门控检索结果转为稳定的机器可读 JSON 证据 |
+| `kb_service.py` | 仅通过宿主机 Unix socket 提供只读 RAG Context 查询接口 |
+| `clients/openclaw_kb_client.mjs` | Node.js Unix socket 查询客户端；不依赖容器内 Python |
 | `calibrate_relevance.py` | 用人工标注查询记录单库 Top1 诊断分数，汇总并扫描候选阈值；不参与生产搜索 |
 
 ## 安装依赖
@@ -139,6 +141,61 @@ JSON schema `1.0` 的字段固定显式生成，例如：
 ```
 
 `text` 直接来自检索时已读取的完整 `chunks.text`；现有 `search.py` 终端输出仍只显示 `snippet`。顶层 `retrieval_status` 只表示**检索阶段状态**：没有门控后的结果为 REJECT；有结果且最高仅为 UNCERTAIN 则为 UNCERTAIN；至少一个 ACCEPT 则为 ACCEPT。UNCERTAIN 保留给未来的 Answerability Judge 检查。ACCEPT 只表示有较强语义候选，**不等于 answerable，更不允许直接编答案**。当前项目尚未实现 Judge、LLM 调用或自动回答。
+
+## 宿主机 Unix socket 查询服务
+
+`kb_service.py` 只复用 `build_rag_context()`，不重新实现搜索或门控，也不提供 ingest、文件读取、数据库查询/修改、命令执行等接口。它**只监听 Unix domain socket**，不监听任何 TCP 地址。Socket 父目录须预先存在；服务不会自动创建 `/run/knowledge-base`，也不会修改其权限。
+
+在支持 Unix socket 的宿主机上，可由已有的普通用户运行：
+
+```bash
+python kb_service.py --socket /run/knowledge-base/kb.sock --socket-mode 0660
+```
+
+唯一查询路由是 `POST /v1/context`，请求体为 UTF-8 JSON：
+
+```json
+{"query":"家庭共享服务器叫什么？","scopes":["family"],"top_k":5}
+```
+
+成功响应为现有 RAG Context schema `1.0` 的完整 JSON，包括 `retrieval_status`、`evidence_count` 和 `evidence`。`GET /health` 仅返回 `{"status":"ok","schema_version":"1.0"}`，表示进程在响应，**不证明**数据库或 Embedding 服务可用。其他路由不存在，也没有任意路径、数据库名或文件名参数。请求体最多 64 KiB，query 最多 4096 个 Unicode 字符；scope 只能是 `chen` / `family`，`top_k` 为 1–50，省略时为 5。
+
+| 情况 | HTTP 状态 | 响应含义 |
+| --- | --- | --- |
+| 检索成功，包括无证据 | `200` | 无证据时 `retrieval_status="REJECT"`、`evidence=[]` |
+| 无效 JSON / query / scope / top_k | `400` | 错误对象，不是 RAG Context |
+| 请求体超过限制 | `413` | 错误对象 |
+| Embedding 服务失败 | `503` | 错误对象；不能当作无证据 |
+| SQLite 或其他内部查询错误 | `500` | 错误对象；不能当作无证据 |
+
+Node.js 客户端通过 socket 发出固定的 `POST /v1/context`，stdout 只输出服务返回的 JSON；正常的 REJECT 仍以退出码 0 结束，参数/服务/协议错误写 stderr 并以非零退出。`--socket` 仅用于指定另一个**本地 Unix socket 路径**，不接受 HTTP URL：
+
+```bash
+node clients/openclaw_kb_client.mjs --query "家庭共享服务器叫什么？" --scope family --top-k 5
+node clients/openclaw_kb_client.mjs --query "问题" --scope chen --scope family --top-k 5
+```
+
+systemd unit 示例（仅供按实际安装路径和权限修改，**未在服务器部署**）：
+
+```ini
+[Unit]
+Description=Local knowledge-base query service
+After=network.target
+
+[Service]
+Type=simple
+User=chen
+WorkingDirectory=/opt/knowledge-base
+ExecStart=/opt/knowledge-base/.venv/bin/python /opt/knowledge-base/kb_service.py --socket /run/knowledge-base/kb.sock --socket-mode 0660
+RuntimeDirectory=knowledge-base
+RuntimeDirectoryMode=0750
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Unix socket 文件权限是本阶段唯一访问控制边界，没有额外身份系统。示例 `0660` 仅允许 owner 与所属 group 连接；目录 `0750` 还要求客户端能沿路径进入。实际接入容器前，需要根据宿主机 `chen`、共享 group、容器内 `node` 的 GID 和只读/可访问的 socket 目录挂载方式配置；不要用 `0777`。**任何能连接该 socket 的进程都可主动请求 `chen` 或 `family`，当前没有按 scope 的调用者授权。**因此只应向被信任的本地进程授予连接权限，尤其不能把它当作已经隔离 `chen` 私有数据的多租户接口。服务启动时仅清理已确认失效的旧 socket，拒绝覆盖普通文件、目录、符号链接或正在监听的 socket，并尽可能在退出时清理自己的 socket。
 
 ## 相关度标定
 
