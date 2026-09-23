@@ -34,6 +34,7 @@ python search.py "问题"
 python search.py "问题" --top-k 5
 python search.py "问题" --scope chen
 python search.py "问题" --scope family
+python search.py "赤狐星云" --scope family --debug-scores
 ```
 
 `--scope` 只接受 `chen` 或 `family`；省略时默认 `chen`，所以原有不带参数的 `kb-chen-ingest.service` 调用方式保持兼容。CLI 搜索仍只查询一个库，不会自动混合两个 scope。导入只处理四种支持的扩展名。失败的文件保留旧索引（如有）；扫描不完整时停止删除清理。
@@ -46,7 +47,21 @@ from search import search_scopes
 results = search_scopes("问题", ["chen", "family"], 5)
 ```
 
-返回 `SearchResult` 列表，每条包含 `scope`、全局 `rank`、`fused_score`、`source_path`、`filename`、`page`、`chunk_index`、`snippet`。每个数据库先独立执行原有 Hybrid Search，再按各库内名次做第二层 RRF；同名次按调用者给出的 scope 顺序稳定排序，不比较跨库的原始 BM25 分数、向量距离或库内融合分数。请求的任一数据库不存在或查询失败时会抛出异常，不会静默返回不完整的多库结果。
+返回 `SearchResult` 列表，保留原有的 `scope`、全局 `rank`、`fused_score`、`source_path`、`filename`、`page`、`chunk_index`、`snippet`，并增加 `semantic_distance`、`semantic_score`、`lexical_match`、`lexical_score` 诊断字段。每个数据库先独立执行原有 Hybrid Search，再按各库内名次做第二层 RRF；同名次按调用者给出的 scope 顺序稳定排序，不比较跨库的原始 BM25 分数、向量距离或库内融合分数。请求的任一数据库不存在或查询失败时会抛出异常，不会静默返回不完整的多库结果。
+
+## 相关度诊断
+
+`fused_score` 是 RRF 排名分数，只表示候选在两路（或多库第二层）排名中的位置，不是绝对相关度，也不能直接作为拒答阈值。向量表配置为 `distance_metric=cosine`；sqlite-vec 0.1.9 的 `distance` 为余弦距离 `1 - cosine_similarity`。因此 `semantic_distance` 是原始距离（越小越近），`semantic_score = 1 - semantic_distance` 是余弦相似度（越大越近，理论范围 -1 至 1，浮点计算可能有微小误差）。它也不是已经校准的“查询相关概率”。
+
+`lexical_match` 表示该 chunk 是否进入本次 FTS 候选 Top-N；`lexical_score` 是对应的 FTS5 原始 BM25 值（越小排序越靠前），仅作诊断，不参与跨库数值比较。未进入 FTS 候选 Top-N 时，`lexical_score` 为 `None`，不等于零分或证明完全没有词面匹配。对于仅由 FTS 路选出的最终结果，程序也会按 chunk ID 计算余弦距离；只有对应向量行不存在时，语义字段才为 `None`。
+
+单库 CLI 默认输出和排序不变；加 `--debug-scores` 后，每条结果额外显示上述原始分数。例如：
+
+```bash
+python search.py "赤狐星云" --scope family --debug-scores
+```
+
+当前只提供诊断数据，**尚未启用无关查询过滤或拒答阈值**。后续应先收集相关与无关查询的实测分数分布，再决定 relevance gate；无关查询现在仍可能有语义 Top-K 结果。
 
 ## 数据库结构
 
