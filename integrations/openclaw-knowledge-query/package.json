@@ -1,0 +1,36 @@
+{
+  "name": "openclaw-plugin-local-knowledge-query",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24.16.0"
+  },
+  "files": [
+    "dist",
+    "openclaw.plugin.json",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "test": "tsc && node --test tests/knowledge-query.test.mjs",
+    "plugin:build": "tsc && openclaw plugins build --entry ./dist/index.js",
+    "plugin:validate": "tsc && openclaw plugins validate --entry ./dist/index.js"
+  },
+  "dependencies": {
+    "typebox": "^1.1.38"
+  },
+  "peerDependencies": {
+    "openclaw": ">=2026.5.17"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.0",
+    "openclaw": "2026.9.4",
+    "typescript": "^5.9.3"
+  },
+  "openclaw": {
+    "extensions": [
+      "./dist/index.js"
+    ]
+  }
+}

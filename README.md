@@ -15,6 +15,7 @@
 | `rag_context.py` | 将现有门控检索结果转为稳定的机器可读 JSON 证据 |
 | `kb_service.py` | 仅通过宿主机 Unix socket 提供只读 RAG Context 查询接口 |
 | `clients/openclaw_kb_client.mjs` | Node.js Unix socket 查询客户端；不依赖容器内 Python |
+| `integrations/openclaw-knowledge-query/` | Agent 级 scope 授权的 OpenClaw `knowledge_query` Tool Plugin；直接使用 Unix socket |
 | `calibrate_relevance.py` | 用人工标注查询记录单库 Top1 诊断分数，汇总并扫描候选阈值；不参与生产搜索 |
 
 ## 安装依赖
@@ -196,6 +197,8 @@ WantedBy=multi-user.target
 ```
 
 Unix socket 文件权限是本阶段唯一访问控制边界，没有额外身份系统。示例 `0660` 仅允许 owner 与所属 group 连接；目录 `0750` 还要求客户端能沿路径进入。实际接入容器前，需要根据宿主机 `chen`、共享 group、容器内 `node` 的 GID 和只读/可访问的 socket 目录挂载方式配置；不要用 `0777`。**任何能连接该 socket 的进程都可主动请求 `chen` 或 `family`，当前没有按 scope 的调用者授权。**因此只应向被信任的本地进程授予连接权限，尤其不能把它当作已经隔离 `chen` 私有数据的多租户接口。服务启动时仅清理已确认失效的旧 socket，拒绝覆盖普通文件、目录、符号链接或正在监听的 socket，并尽可能在退出时清理自己的 socket。
+
+OpenClaw Agent 使用的插件代码、`agentId`/`agentScopes` 授权示例和本地验证命令见 [`integrations/openclaw-knowledge-query/README.md`](integrations/openclaw-knowledge-query/README.md)。插件仅约束通过该工具发起的查询；它不能替代 Unix socket 的文件权限控制。仓库中的插件代码不代表已在 OpenClaw 容器安装或验证。
 
 ## 相关度标定
 
