@@ -32,6 +32,7 @@ from database import (
 )
 from embeddings import EmbeddingError, embed_texts
 from parsers import ParseError, parse_document
+from scope_lock import scope_file_lock
 
 LOGGER = logging.getLogger("knowledge.ingest")
 
@@ -134,8 +135,14 @@ def ingest_one(connection: sqlite3.Connection, path: Path, scope: KnowledgeScope
 
 
 def ingest_scope(scope_name: str) -> dict[str, int]:
-    """Run the existing full incremental pass and return machine-readable counts."""
+    """Serialize every caller of the same scope's full incremental pass."""
     scope = get_scope(scope_name)
+    with scope_file_lock(scope.state_dir / "ingest.lock"):
+        return _ingest_scope_locked(scope)
+
+
+def _ingest_scope_locked(scope: KnowledgeScope) -> dict[str, int]:
+    """Run the existing incremental pass while ingest_scope owns its lock."""
     files = discover_source_files(scope)
     connection = connect_database(scope, create=True)
     try:

@@ -7,9 +7,12 @@ import hashlib
 import json
 import os
 import sqlite3
+import stat
 import tempfile
+import threading
+import time
 import unittest
-from contextlib import closing
+from contextlib import closing, contextmanager
 from contextlib import redirect_stderr
 from pathlib import Path
 from unittest.mock import patch
@@ -113,6 +116,10 @@ class ImporterTests(unittest.TestCase):
         return ki.KnowledgeImporter(
             self.load_policy(), inbox_root=self.inbox, state_db_path=self.state,
             lock_path=self.lock, settle_seconds=0, dry_run=dry_run,
+            publication_lock_paths={
+                "chen": self.root / "scope-chen" / "publish.lock",
+                "family": self.root / "scope-family" / "publish.lock",
+            },
             ingest_function=good_ingest if ingest is None else ingest,
             sleep_function=(lambda _seconds: None) if sleep is None else sleep,
         )
@@ -128,6 +135,10 @@ class ImporterTests(unittest.TestCase):
             self.load_policy(), uploader=uploader, inbox_root=self.inbox,
             state_db_path=self.root / "state" / uploader / "imports.db",
             lock_path=lock, settle_seconds=0, dry_run=dry_run,
+            publication_lock_paths={
+                "chen": self.root / "scope-chen" / "publish.lock",
+                "family": self.root / "scope-family" / "publish.lock",
+            },
             ingest_function=good_ingest if ingest is None else ingest,
             sleep_function=lambda _seconds: None,
         )
@@ -513,6 +524,93 @@ class ImporterTests(unittest.TestCase):
         importer = ki.KnowledgeImporter(self.load_policy(), dry_run=True)
         self.assertEqual(importer.state_db_path, ki.STATE_DB_PATH)
         self.assertEqual(importer.lock_path, ki.LOCK_PATH)
+
+    @unittest.skipUnless(os.name == "posix", "Unix permission bits are required")
+    def test_publish_sets_group_read_under_restrictive_umask(self) -> None:
+        own_inbox = self.write("private.txt", "private contents")
+        shared_inbox = self.write("shared.txt", "shared contents", kind="shared")
+        os.chmod(own_inbox.parent, 0o700)
+        previous = os.umask(0o077)
+        try:
+            results = self.importer().run()
+        finally:
+            os.umask(previous)
+        self.assertEqual([item.status for item in results], ["INDEXED", "INDEXED"])
+        self.assertEqual(stat.S_IMODE((self.chen / "private.txt").stat().st_mode), 0o640)
+        self.assertEqual(stat.S_IMODE((self.family / "shared.txt").stat().st_mode), 0o640)
+        self.assertEqual(stat.S_IMODE(own_inbox.parent.stat().st_mode), 0o700)
+
+    def test_duplicate_and_conflict_unchanged_with_publication_lock(self) -> None:
+        (self.family / "known.txt").write_text("same", encoding="utf-8")
+        self.write("copy.txt", "same", kind="shared")
+        self.write("known.txt", "different", kind="shared")
+        results = self.importer().run()
+        self.assertEqual({item.original_filename: item.status for item in results}, {
+            "copy.txt": "DUPLICATE", "known.txt": "CONFLICT",
+        })
+        self.assertEqual((self.family / "known.txt").read_text(encoding="utf-8"), "same")
+
+    def test_simultaneous_uploaders_cannot_publish_same_sha_twice(self) -> None:
+        self.write("chen.txt", "same shared bytes", kind="shared")
+        self.write("liang.txt", "same shared bytes", user="liang", kind="shared")
+        original_publish = ki.KnowledgeImporter._publish
+        first_publishing = threading.Event()
+        release_first = threading.Event()
+        outcomes: list[ki.ImportRecord] = []
+        errors: list[Exception] = []
+
+        def slow_publish(importer, *args):
+            if args[0].uploader == "chen":
+                first_publishing.set()
+                if not release_first.wait(5):
+                    raise TimeoutError("test publication wait timed out")
+            return original_publish(importer, *args)
+
+        def run_user(user: str) -> None:
+            try:
+                outcomes.extend(self.per_user_importer(user).run())
+            except Exception as exc:
+                errors.append(exc)
+
+        with patch.object(ki.KnowledgeImporter, "_publish", slow_publish):
+            chen_thread = threading.Thread(target=run_user, args=("chen",))
+            liang_thread = threading.Thread(target=run_user, args=("liang",))
+            chen_thread.start()
+            try:
+                self.assertTrue(first_publishing.wait(5))
+                liang_thread.start()
+                time.sleep(0.1)
+            finally:
+                release_first.set()
+                chen_thread.join(5)
+                if liang_thread.ident is not None:
+                    liang_thread.join(5)
+        self.assertFalse(chen_thread.is_alive() or liang_thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(sorted(item.status for item in outcomes), ["DUPLICATE", "INDEXED"])
+        self.assertEqual(len(list(self.family.glob("*.txt"))), 1)
+
+    def test_publication_lock_released_before_ingest(self) -> None:
+        self.write("shared.txt", "shared bytes", kind="shared")
+        original_lock = ki.scope_file_lock
+        active = 0
+
+        @contextmanager
+        def tracked_lock(path: Path):
+            nonlocal active
+            with original_lock(path):
+                active += 1
+                try:
+                    yield
+                finally:
+                    active -= 1
+
+        def ingest_after_publication(_scope: str) -> dict[str, int]:
+            self.assertEqual(active, 0)
+            return {"failed": 0}
+
+        with patch.object(ki, "scope_file_lock", tracked_lock):
+            self.assertEqual(self.importer(ingest=ingest_after_publication).run()[0].status, "INDEXED")
 
 
 if __name__ == "__main__":

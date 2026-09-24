@@ -23,6 +23,7 @@ from typing import Any, Callable, Mapping
 from config import KNOWLEDGE_SCOPES, SUPPORTED_SUFFIXES, reject_symlink_components
 from ingest import ingest_scope
 from parsers import ParseError, parse_document
+from scope_lock import scope_file_lock
 
 POLICY_PATH = Path("/etc/knowledge-import/policy.json")
 INBOX_ROOT = Path("/srv/storage/ai-inbox")
@@ -465,6 +466,7 @@ class KnowledgeImporter:
         inbox_root: Path = INBOX_ROOT,
         state_db_path: Path | None = None,
         lock_path: Path | None = None,
+        publication_lock_paths: Mapping[str, Path] | None = None,
         settle_seconds: float = DEFAULT_SETTLE_SECONDS,
         dry_run: bool = False,
         ingest_function: Callable[[str], Mapping[str, int]] = ingest_scope,
@@ -483,6 +485,10 @@ class KnowledgeImporter:
         )
         self.lock_path = lock_path or (
             LOCK_PATH.parent / uploader / LOCK_PATH.name if uploader else LOCK_PATH
+        )
+        self.publication_lock_paths = (
+            {name: scope.state_dir / "publish.lock" for name, scope in KNOWLEDGE_SCOPES.items()}
+            if publication_lock_paths is None else publication_lock_paths
         )
         self.settle_seconds = settle_seconds
         self.dry_run = dry_run
@@ -609,6 +615,8 @@ class KnowledgeImporter:
                 for offset in range(0, len(data), READ_BLOCK_BYTES):
                     target.write(data[offset:offset + READ_BLOCK_BYTES])
                 target.flush()
+                if os.name != "nt":
+                    os.fchmod(target.fileno(), 0o640)
                 os.fsync(target.fileno())
             os.link(temporary, final)
             _fsync_directory(destination)
@@ -633,6 +641,16 @@ class KnowledgeImporter:
         }, ensure_ascii=True, sort_keys=True))
 
     def _process(self, candidate: Candidate, store: ImportStore | None) -> ImportRecord:
+        route = self.policy.routes[candidate.uploader][candidate.kind]
+        if self.dry_run or not route.enabled:
+            return self._process_candidate(candidate, store)
+        assert route.scope is not None
+        # Held across source duplicate check and publication, then released
+        # before _index_pending() calls ingest_scope() and its own scope lock.
+        with scope_file_lock(self.publication_lock_paths[route.scope]):
+            return self._process_candidate(candidate, store)
+
+    def _process_candidate(self, candidate: Candidate, store: ImportStore | None) -> ImportRecord:
         started = time.perf_counter()
         record = self._new_record(candidate)
         if store is not None:

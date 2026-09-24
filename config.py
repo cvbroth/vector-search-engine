@@ -25,18 +25,16 @@ class KnowledgeScope:
         return Path("/srv/storage/knowledge") / self.area / self.name
 
     @property
+    def state_dir(self) -> Path:
+        return Path("/var/lib/knowledge-base") / self.area / self.name
+
+    @property
     def database_path(self) -> Path:
-        return (
-            Path("/var/lib/knowledge-base")
-            / self.area
-            / self.name
-            / "index"
-            / "knowledge.db"
-        )
+        return self.state_dir / "index" / "knowledge.db"
 
     @property
     def log_dir(self) -> Path:
-        return Path("/var/lib/knowledge-base") / self.area / self.name / "logs"
+        return self.state_dir / "logs"
 
 
 DEFAULT_SCOPE = "chen"
