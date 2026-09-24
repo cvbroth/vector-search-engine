@@ -1,0 +1,34 @@
+{
+  "schema_version": "1.0",
+  "max_file_size_bytes": 104857600,
+  "routes": {
+    "chen": {
+      "private": {
+        "enabled": true,
+        "scope": "chen",
+        "destination": "/srv/storage/knowledge/private/chen"
+      },
+      "shared": {
+        "enabled": true,
+        "scope": "family",
+        "destination": "/srv/storage/knowledge/shared/family"
+      }
+    },
+    "liang": {
+      "private": { "enabled": false },
+      "shared": {
+        "enabled": true,
+        "scope": "family",
+        "destination": "/srv/storage/knowledge/shared/family"
+      }
+    },
+    "ziling": {
+      "private": { "enabled": false },
+      "shared": {
+        "enabled": true,
+        "scope": "family",
+        "destination": "/srv/storage/knowledge/shared/family"
+      }
+    }
+  }
+}

@@ -133,6 +133,37 @@ def ingest_one(connection: sqlite3.Connection, path: Path, scope: KnowledgeScope
     return "updated" if existing else "added"
 
 
+def ingest_scope(scope_name: str) -> dict[str, int]:
+    """Run the existing full incremental pass and return machine-readable counts."""
+    scope = get_scope(scope_name)
+    files = discover_source_files(scope)
+    connection = connect_database(scope, create=True)
+    try:
+        initialize_schema(connection)
+        seen = {str(path) for path in files}
+        counts = {"added": 0, "updated": 0, "skipped": 0, "deleted": 0, "failed": 0}
+        for path in files:
+            try:
+                status = ingest_one(connection, path, scope)
+                counts[status] += 1
+                LOGGER.info("%s: %s", status, path)
+            except (OSError, ParseError, EmbeddingError, sqlite3.Error, ValueError) as exc:
+                counts["failed"] += 1
+                LOGGER.error("failed: %s: %s", path, exc)
+        for source_path in sorted(list_document_paths(connection) - seen):
+            try:
+                if delete_document(connection, source_path):
+                    counts["deleted"] += 1
+                    LOGGER.info("deleted: %s", source_path)
+            except (sqlite3.Error, ValueError) as exc:
+                counts["failed"] += 1
+                LOGGER.error("delete failed: %s: %s", source_path, exc)
+        LOGGER.info("summary: %s", counts)
+        return counts
+    finally:
+        connection.close()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Index a local knowledge scope")
     parser.add_argument(
@@ -147,32 +178,7 @@ def main() -> int:
         print(f"cannot open log directory: {exc}", file=sys.stderr)
         return 1
     try:
-        files = discover_source_files(scope)
-        connection = connect_database(scope, create=True)
-        try:
-            initialize_schema(connection)
-            seen = {str(path) for path in files}
-            counts = {"added": 0, "updated": 0, "skipped": 0, "deleted": 0, "failed": 0}
-            for path in files:
-                try:
-                    status = ingest_one(connection, path, scope)
-                    counts[status] += 1
-                    LOGGER.info("%s: %s", status, path)
-                except (OSError, ParseError, EmbeddingError, sqlite3.Error, ValueError) as exc:
-                    counts["failed"] += 1
-                    LOGGER.error("failed: %s: %s", path, exc)
-            for source_path in sorted(list_document_paths(connection) - seen):
-                try:
-                    if delete_document(connection, source_path):
-                        counts["deleted"] += 1
-                        LOGGER.info("deleted: %s", source_path)
-                except (sqlite3.Error, ValueError) as exc:
-                    counts["failed"] += 1
-                    LOGGER.error("delete failed: %s: %s", source_path, exc)
-            LOGGER.info("summary: %s", counts)
-            return 1 if counts["failed"] else 0
-        finally:
-            connection.close()
+        return 1 if ingest_scope(args.scope)["failed"] else 0
     except (OSError, sqlite3.Error, ValueError) as exc:
         LOGGER.error("ingest aborted: %s", exc)
         return 1
