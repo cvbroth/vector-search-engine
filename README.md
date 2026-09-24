@@ -249,59 +249,69 @@ OpenClaw 插件只请求 Broker socket，模型仅看到 `knowledge_private(quer
   → RAG SQLite / FTS5 / vector 派生索引
 ```
 
-**正式原始文件是唯一事实源。** `/var/lib/knowledge-import/imports.db` 是独立的导入元数据/审计库，不是 RAG 的 `knowledge.db`；它只存 import_id、上传者、private/shared、scope、原/目标文件名和路径、SHA-256、大小、状态、错误码/简短错误消息、创建/更新时间与 indexed_at，绝不保存正文、解析文本或 chunk。Importer 不直接写 RAG 数据库。一次扫描成功导入同一 scope 多个文件时只调用一次现有 `ingest_scope(scope)`；以其 `failed == 0` 且无异常为索引成功依据。`INDEX_ERROR` 保留 Source，下一轮 Importer 会重试该 scope；现有 ingest timer 也可重新构建索引。
+**正式原始文件是唯一事实源。** 每用户 `/var/lib/knowledge-import/<uploader>/imports.db` 是独立的导入元数据/审计库，不是 RAG 的 `knowledge.db`；它只存 import_id、上传者、private/shared、scope、原/目标文件名和路径、SHA-256、大小、状态、错误码/简短错误消息、创建/更新时间与 indexed_at，绝不保存正文、解析文本或 chunk。Importer 不直接写 RAG 数据库。一次扫描成功导入同一 scope 多个文件时只调用一次现有 `ingest_scope(scope)`；以其 `failed == 0` 且无异常为索引成功依据。`INDEX_ERROR` 保留 Source，仅由同一 uploader 的下一轮 Importer 重试；现有 ingest timer 也可重新构建索引。
 
-输入只来自 policy 中上传者对应的 `/srv/storage/ai-inbox/<user>/private/` 与 `shared/` 的**第一层文件**，不递归扫描 `rejected/`，也不把 Source 当输入。无需 `.ready`、特殊文件名或特定上传协议。第一轮记录大小、纳秒 mtime、设备和 inode；全轮仅等待一次（默认 2 秒）后逐个复核，变化文件留在 Inbox 供下一轮处理。隐藏文件及 `.tmp`、`.part`、`~` 尾缀暂不处理。仅支持大小写不敏感的 MD/TXT/DOCX/可提取文字的 PDF；空文件、超限、不支持格式、symlink、FIFO 等非普通文件及 hard link 均拒绝。扫描 PDF 无可提取文字时为 `NO_EXTRACTABLE_TEXT`，未来 OCR 阶段才会支持；坏文档为 `PARSER_ERROR`。每个文件独立处理，不因单份坏文件中断其他候选。
+指定 `--uploader` 后，输入**只来自该用户** `/srv/storage/ai-inbox/<uploader>/private/` 与 `shared/` 的第一层文件；即使 policy 包含其他用户，也不扫描其 Inbox。不会递归扫描 `rejected/`，也不把 Source 当输入。无需 `.ready`、特殊文件名或特定上传协议。第一轮记录大小、纳秒 mtime、设备和 inode；全轮仅等待一次（默认 2 秒）后逐个复核，变化文件留在 Inbox 供下一轮处理。隐藏文件及 `.tmp`、`.part`、`~` 尾缀暂不处理。仅支持大小写不敏感的 MD/TXT/DOCX/可提取文字的 PDF；空文件、超限、不支持格式、symlink、FIFO 等非普通文件及 hard link 均拒绝。扫描 PDF 无可提取文字时为 `NO_EXTRACTABLE_TEXT`，未来 OCR 阶段才会支持；坏文档为 `PARSER_ERROR`。每个文件独立处理，不因单份坏文件中断其他候选。
 
 去重键是**目标 scope + 流式 SHA-256**，不跨 private/shared 全局去重；即使 Source 文件早于 Importer 已存在，也检查 Source 原文件。普通且在大小上限内的候选逐块计算 SHA；空文件记录空内容 SHA，超限或非普通文件不读取/哈希。同 scope 相同内容判 `DUPLICATE`，同名不同内容判 `CONFLICT`，均不写 Source、不自动改名或覆盖，原 Inbox 文件移至 `<user>/rejected/<kind>/<status>/<import_id>__<original_filename>`。其他拒绝文件也按状态保留在那里，不静默删除；如果隔离移动失败，原 Inbox 文件仍保留并在元数据中标记。导入审计和日志不记录正文；日志仅记 ID、上传者、类别、scope、文件名、大小、SHA 前缀、状态与耗时。当前 `parsers.py` 接收内存中的字节快照，因此解析接近大小上限的文件仍需相应内存；上线前应按机器内存评估 policy 上限。
 
-正式发布使用目标目录内独占临时文件：写入、`fsync`，再以不覆盖现有 final 名称的原子硬链接发布，清理临时文件后才移除原 Inbox 文件。这种复制到目标目录的方式也适用于 Inbox 与 Source 不在同一 filesystem；中途失败不会把半写入内容作为 final 文件暴露。真实 NAS 的 mergerfs/FUSE 是否允许该目录中的硬链接和目录 `fsync`、权限及容量，**仍需在部署前实测**。同一时间通过 `/run/knowledge-import/import.lock` 的独占锁限制为一个 Importer；Linux 使用 `fcntl.flock`。运行用户必须控制锁目录和 Importer DB 目录。
+正式发布使用目标目录内独占临时文件：写入、`fsync`，再以不覆盖现有 final 名称的原子硬链接发布，清理临时文件后才移除原 Inbox 文件。这种复制到目标目录的方式也适用于 Inbox 与 Source 不在同一 filesystem；中途失败不会把半写入内容作为 final 文件暴露。真实 NAS 的 mergerfs/FUSE 是否允许该目录中的硬链接和目录 `fsync`、权限及容量，**仍需在部署前实测**。每个 uploader 使用自己的 `/run/knowledge-import/<uploader>/import.lock` 独占锁：同一用户不能并发导入，不同用户的锁互不阻塞；Linux 使用 `fcntl.flock`。运行用户必须控制自己的锁目录和 Importer DB 目录。
 
-Importer policy 固定由 `--policy` 指向 JSON，示例见 [`examples/knowledge-import-policy.json`](examples/knowledge-import-policy.json)。顶层必须有 `schema_version="1.0"`、正整数 `max_file_size_bytes`、`routes`；每位上传者必须显式配置 `private` 和 `shared`。启用的 route 必须含 `enabled=true`、当前 `config.py` 已知的 `scope`、绝对 `destination`，且 destination 必须**精确等于**该 scope 的正式 Source 根目录，不能指向 Inbox 或任意其他路径。关闭的 route 仅写 `{"enabled":false}`。非法/缺失 policy、重复键、未知 scope 或路径不匹配均拒绝启动；CLI 不接受任意 source/destination/scope 参数。当前只启用 `chen`、`family`；示例里的 `liang`、`ziling` 私有 route 仍关闭。实际 Inbox 账号可能叫 `azl` 而非 `ziling`，**必须由部署者核对后调整 policy，代码不猜映射**。
+Importer policy 固定由 `--policy` 指向 JSON，格式示例见 [`examples/knowledge-import-policy.json`](examples/knowledge-import-policy.json)；示例文件含多个 uploader 仅用于说明格式，生产实例建议拆成单 uploader policy。顶层必须有 `schema_version="1.0"`、正整数 `max_file_size_bytes`、`routes`；每位上传者必须显式配置 `private` 和 `shared`。启用的 route 必须含 `enabled=true`、当前 `config.py` 已知的 `scope`、绝对 `destination`，且 destination 必须**精确等于**该 scope 的正式 Source 根目录，不能指向 Inbox 或任意其他路径。关闭的 route 仅写 `{"enabled":false}`。非法/缺失 policy、重复键、未知 scope、无效或不在 policy 中的 `--uploader`、路径不匹配均拒绝启动；CLI 不接受任意 source/destination/scope/state/lock 参数。当前只启用 `chen`、`family` 两个知识库 scope；`liang`、`azl` 的 private route 仍关闭。
 
-CLI 每次只扫描一轮，`--once` 可显式写出；无 daemon/watch loop：
+CLI 每次只扫描一轮，`--once` 可显式写出；无 daemon/watch loop。生产多用户实例应显式指定 `--uploader`，并让 policy 只包含该 Unix/Inbox 用户的 routes：
 
 ```bash
-python knowledge_importer.py --policy /etc/knowledge-import/policy.json --once
-python knowledge_importer.py --policy /etc/knowledge-import/policy.json --once --dry-run
-python knowledge_importer.py --policy /etc/knowledge-import/policy.json --once --settle-seconds 5
+python knowledge_importer.py --policy /etc/knowledge-import/chen.json --uploader chen --once
+python knowledge_importer.py --policy /etc/knowledge-import/liang.json --uploader liang --once --dry-run
+python knowledge_importer.py --policy /etc/knowledge-import/azl.json --uploader azl --once --settle-seconds 5
 ```
 
-`--dry-run` 会扫描、复核稳定性、解析并判断 `WOULD_IMPORT` / `WOULD_REJECTED` / `WOULD_DUPLICATE` / `WOULD_CONFLICT`，但不会移动文件、创建或修改 `imports.db`、调用 ingest。普通导入成功后 Inbox 文件消失；再次运行空 Inbox 不重复建记录或重复索引。Importer 的 Python API 是 `load_policy()` 加 `KnowledgeImporter(policy).run()`，可供未来受信任的调用方复用。
+不传 `--uploader` 保留 V2.1 单实例开发/测试模式：扫描 policy 中所有用户，使用旧的 `/var/lib/knowledge-import/imports.db` 和 `/run/knowledge-import/import.lock`；**不要用于生产多用户权限隔离**。`--dry-run` 会扫描、复核稳定性、解析并判断 `WOULD_IMPORT` / `WOULD_REJECTED` / `WOULD_DUPLICATE` / `WOULD_CONFLICT`，但不会移动文件、创建或修改 `imports.db`、调用 ingest。普通导入成功后 Inbox 文件消失；再次运行空 Inbox 不重复建记录或重复索引。Importer 的 Python API 是 `load_policy()` 加 `KnowledgeImporter(policy, uploader="chen").run()`，受信任调用方和本地测试可以注入临时状态库/锁路径。
 
-systemd 示例仅供代码验收后的单独部署规划，**未修改或测试真实服务器**：
+规划的独立 policy 为 `/etc/knowledge-import/chen.json`、`/etc/knowledge-import/liang.json`、`/etc/knowledge-import/azl.json`，每份只含对应 uploader。三者的 route 分别是：`chen: private→chen, shared→family`；`liang: private→disabled, shared→family`；`azl: private→disabled, shared→family`。这里 `chen`/`family` 是现有知识库 scope，`liang`/`azl` **不是**已启用的 private scope。OpenClaw Agent 名 `ziling` 与 Unix/Inbox 用户 `azl` 不同；本层只认真实 uploader 身份，未来由尚未实现的 Import Broker 负责 `ziling → azl` 映射。不要把 Agent 名直接作为 Inbox 用户猜测。
+
+systemd template 仅供代码验收后的单独部署规划，**未创建 unit，也未修改或测试真实服务器**：
 
 ```ini
-# knowledge-import.service
+# knowledge-import@.service
 [Unit]
-Description=Import settled knowledge Inbox files
-After=network.target
+Description=Knowledge Importer for %i
+After=kb-embed.service
+Requires=kb-embed.service
 
 [Service]
 Type=oneshot
-User=chen
-Group=nas-users
+User=%i
+Group=%i
+# 仅在部署确认 nas-users 的授权范围后启用；不是私人 Inbox 的通行证。
+SupplementaryGroups=nas-users
 WorkingDirectory=/opt/knowledge-base
-ExecStart=/opt/knowledge-base/.venv/bin/python /opt/knowledge-base/knowledge_importer.py --policy /etc/knowledge-import/policy.json --once
-RuntimeDirectory=knowledge-import
-RuntimeDirectoryMode=0750
+StateDirectory=knowledge-import/%i
+StateDirectoryMode=0700
+RuntimeDirectory=knowledge-import/%i
+RuntimeDirectoryMode=0700
+UMask=0077
+ExecStart=/opt/knowledge-base/.venv/bin/python /opt/knowledge-base/knowledge_importer.py --policy /etc/knowledge-import/%i.json --uploader %i --once
 ```
 
 ```ini
-# knowledge-import.timer
+# knowledge-import@.timer
 [Unit]
-Description=Import knowledge Inbox once per minute
+Description=Run Knowledge Importer for %i
 
 [Timer]
 OnBootSec=1min
 OnUnitActiveSec=1min
-Unit=knowledge-import.service
+Unit=knowledge-import@%i.service
 
 [Install]
 WantedBy=timers.target
 ```
 
-服务用户无需 root，但必须有 Inbox 读写、目标 Source 写入、`/var/lib/knowledge-import` 写入及索引/Embedding 所需权限；请在真实服务器核对用户组、挂载和 policy 文件权限。未来若加 OpenClaw 导入工具，可提供 `knowledge_import_private` / `knowledge_import_shared`，只接收可信 attachment handle；模型不应传任意路径、scope、agent_id 或 destination。本次没有实现 Import Broker、插件、Web 上传或 OCR。
+[systemd.exec 手册](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html)允许 `StateDirectory=`、`RuntimeDirectory=` 使用相对嵌套目录（如 `foo/bar`），管理器创建其父目录，并为最内层目录设置服务用户/组和 Mode；`RuntimeDirectory` 最内层会在 oneshot 停止后移除，下次运行重建。仍须在实际服务器核对 systemd 版本、unit 解析结果、目录属主与权限、timer 行为及失败恢复。不要把上面示例视为已部署成功。
+
+每个私人 Inbox 应保持 `/srv/storage/ai-inbox/{chen,liang,azl}` 分别由同名 Unix 用户拥有，目录模式 `0700`；不要为方便 Importer 把所有 Inbox 改成 `0770`，也不要让 `chen` 读取 `liang` 的 Inbox。每个实例只需本人的 Inbox 读写、本人 state/runtime 目录和 policy 读取权限。`family` 共享 Source 可通过经审核的 `nas-users` 等 supplementary group 授予写入，但组成员身份本身**不保证**能够写：还要核对目录组属主、实际 mode/ACL、mergerfs 行为，以及共享索引数据库和日志的写权限。特别是示例的 `UMask=0077` 会收紧新建文件权限；现有 Importer 创建文件的模式可能因此不适合跨用户后续读取/重建索引。多用户轮流写同一个 `family` 索引前必须在真实主机设计并验证受控 ACL/属组与 SQLite 并发权限；不要靠放宽私人 Inbox 权限解决。服务用户无需 root。未来若加 OpenClaw 导入工具，可提供 `knowledge_import_private` / `knowledge_import_shared`，只接收可信 attachment handle；模型不应传任意路径、scope、agent_id 或 destination。本次没有实现 Import Broker、插件、Web 上传或 OCR。
 
 ## 相关度标定
 

@@ -249,10 +249,17 @@ class ImportStore:
             asdict(record),
         )
 
-    def pending(self) -> dict[str, list[str]]:
+    def pending(self, uploader: str | None = None) -> dict[str, list[str]]:
         result: dict[str, list[str]] = {}
+        query = (
+            "SELECT scope,import_id FROM imports WHERE status IN "
+            "('IMPORTED','INDEXING','INDEX_ERROR')"
+        )
+        if uploader is not None:
+            query += " AND uploader=?"
+        query += " ORDER BY created_at"
         for row in self.connection.execute(
-            "SELECT scope,import_id FROM imports WHERE status IN ('IMPORTED','INDEXING','INDEX_ERROR') ORDER BY created_at"
+            query, () if uploader is None else (uploader,)
         ):
             if row["scope"] in KNOWLEDGE_SCOPES:
                 result.setdefault(row["scope"], []).append(row["import_id"])
@@ -454,9 +461,10 @@ class KnowledgeImporter:
         self,
         policy: ImportPolicy,
         *,
+        uploader: str | None = None,
         inbox_root: Path = INBOX_ROOT,
-        state_db_path: Path = STATE_DB_PATH,
-        lock_path: Path = LOCK_PATH,
+        state_db_path: Path | None = None,
+        lock_path: Path | None = None,
         settle_seconds: float = DEFAULT_SETTLE_SECONDS,
         dry_run: bool = False,
         ingest_function: Callable[[str], Mapping[str, int]] = ingest_scope,
@@ -464,10 +472,18 @@ class KnowledgeImporter:
     ) -> None:
         if not math.isfinite(settle_seconds) or not 0 <= settle_seconds <= 3600:
             raise ValueError("settle_seconds must be between 0 and 3600")
+        if uploader is not None:
+            if not isinstance(uploader, str) or USER_PATTERN.fullmatch(uploader) is None or uploader not in policy.routes:
+                raise ImportPolicyError("uploader must be a valid name present in policy routes")
         self.policy = policy
+        self.uploader = uploader
         self.inbox_root = inbox_root
-        self.state_db_path = state_db_path
-        self.lock_path = lock_path
+        self.state_db_path = state_db_path or (
+            STATE_DB_PATH.parent / uploader / STATE_DB_PATH.name if uploader else STATE_DB_PATH
+        )
+        self.lock_path = lock_path or (
+            LOCK_PATH.parent / uploader / LOCK_PATH.name if uploader else LOCK_PATH
+        )
         self.settle_seconds = settle_seconds
         self.dry_run = dry_run
         self.ingest_function = ingest_function
@@ -476,7 +492,8 @@ class KnowledgeImporter:
     def _scan(self) -> list[Candidate]:
         reject_symlink_components(self.inbox_root)
         candidates: list[Candidate] = []
-        for user in sorted(self.policy.routes):
+        users = (self.uploader,) if self.uploader is not None else sorted(self.policy.routes)
+        for user in users:
             for kind in KINDS:
                 folder = self.inbox_root / user / kind
                 reject_symlink_components(folder)
@@ -675,7 +692,7 @@ class KnowledgeImporter:
 
     def _index_pending(self, store: ImportStore, fresh: list[ImportRecord]) -> None:
         current = {record.import_id: record for record in fresh}
-        for scope, ids in sorted(store.pending().items()):
+        for scope, ids in sorted(store.pending(self.uploader).items()):
             started = time.perf_counter()
             store.set_index_status(ids, "INDEXING", None)
             try:
@@ -722,6 +739,7 @@ class KnowledgeImporter:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Import settled Inbox files into policy-routed knowledge sources")
     parser.add_argument("--policy", type=Path, default=POLICY_PATH)
+    parser.add_argument("--uploader", help="scan only this configured Unix/Inbox uploader")
     parser.add_argument("--once", action="store_true", help="run one scan (the default)")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--settle-seconds", type=float, default=DEFAULT_SETTLE_SECONDS)
@@ -729,7 +747,9 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, stream=sys.stderr, format="%(asctime)s %(levelname)s %(message)s")
     try:
         policy = load_policy(args.policy)
-        importer = KnowledgeImporter(policy, settle_seconds=args.settle_seconds, dry_run=args.dry_run)
+        importer = KnowledgeImporter(
+            policy, uploader=args.uploader, settle_seconds=args.settle_seconds, dry_run=args.dry_run,
+        )
         results = importer.run()
     except (ImportPolicyError, ImporterBusy, OSError, sqlite3.Error, ValueError) as exc:
         LOGGER.error("import aborted: %s", exc)

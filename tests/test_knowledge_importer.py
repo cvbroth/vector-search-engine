@@ -117,6 +117,21 @@ class ImporterTests(unittest.TestCase):
             sleep_function=(lambda _seconds: None) if sleep is None else sleep,
         )
 
+    def per_user_importer(self, uploader: str, *, dry_run: bool = False, ingest=None) -> ki.KnowledgeImporter:
+        def good_ingest(scope: str) -> dict[str, int]:
+            self.calls.append(scope)
+            return {"failed": 0}
+
+        lock = self.root / "runtime" / uploader / "import.lock"
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        return ki.KnowledgeImporter(
+            self.load_policy(), uploader=uploader, inbox_root=self.inbox,
+            state_db_path=self.root / "state" / uploader / "imports.db",
+            lock_path=lock, settle_seconds=0, dry_run=dry_run,
+            ingest_function=good_ingest if ingest is None else ingest,
+            sleep_function=lambda _seconds: None,
+        )
+
     def rows(self) -> list[sqlite3.Row]:
         with closing(sqlite3.connect(self.state)) as connection:
             connection.row_factory = sqlite3.Row
@@ -386,6 +401,118 @@ class ImporterTests(unittest.TestCase):
                 load.assert_called_once_with(self.policy_path)
                 self.assertTrue(importer_type.call_args.kwargs["dry_run"])
                 self.assertEqual(importer_type.call_args.kwargs["settle_seconds"], 0)
+
+    def test_selected_uploader_scans_only_own_inbox(self) -> None:
+        own = self.write("chen.txt", "chen content")
+        other = self.write("liang.txt", "liang content", user="liang", kind="shared")
+        results = self.per_user_importer("chen").run()
+        self.assertEqual([record.original_filename for record in results], [own.name])
+        self.assertTrue(other.exists())
+        self.assertEqual(self.calls, ["chen"])
+        self.assertFalse((self.root / "state" / "liang").exists())
+
+    def test_selected_uploader_never_traverses_other_policy_user(self) -> None:
+        own = self.write("only.txt", "own content")
+        original = ki.reject_symlink_components
+
+        def reject_other(path: Path) -> None:
+            if "liang" in path.parts:
+                raise AssertionError("other user's path must not be inspected")
+            original(path)
+
+        importer = self.per_user_importer("chen")
+        with patch.object(ki, "reject_symlink_components", side_effect=reject_other):
+            self.assertEqual([row.original_filename for row in importer.run()], [own.name])
+
+    def test_unknown_uploader_fails_before_scanning_or_state_creation(self) -> None:
+        with self.assertRaises(ki.ImportPolicyError):
+            self.per_user_importer("azl")
+        self.assertFalse((self.root / "state" / "azl").exists())
+
+    def test_invalid_uploader_fails_closed(self) -> None:
+        for name in ("../liang", "bad/name", "", "a" * 129):
+            with self.subTest(name=name), self.assertRaises(ki.ImportPolicyError):
+                ki.KnowledgeImporter(self.load_policy(), uploader=name)
+
+    def test_chen_default_state_and_lock_paths(self) -> None:
+        importer = ki.KnowledgeImporter(self.load_policy(), uploader="chen", dry_run=True)
+        self.assertEqual(importer.state_db_path, Path("/var/lib/knowledge-import/chen/imports.db"))
+        self.assertEqual(importer.lock_path, Path("/run/knowledge-import/chen/import.lock"))
+
+    def test_liang_default_state_and_lock_paths(self) -> None:
+        importer = ki.KnowledgeImporter(self.load_policy(), uploader="liang", dry_run=True)
+        self.assertEqual(importer.state_db_path, Path("/var/lib/knowledge-import/liang/imports.db"))
+        self.assertEqual(importer.lock_path, Path("/run/knowledge-import/liang/import.lock"))
+
+    def test_selected_uploaders_write_independent_state_databases(self) -> None:
+        self.write("chen.txt", "chen content")
+        self.write("liang.txt", "liang content", user="liang", kind="shared")
+        self.per_user_importer("chen").run()
+        self.per_user_importer("liang").run()
+        for user in ("chen", "liang"):
+            path = self.root / "state" / user / "imports.db"
+            with closing(sqlite3.connect(path)) as connection:
+                self.assertEqual(connection.execute("SELECT uploader FROM imports").fetchall(), [(user,)])
+
+    def test_pending_index_error_remains_with_own_uploader(self) -> None:
+        self.write("retry.txt", "needs retry", user="chen")
+        self.per_user_importer("chen", ingest=lambda _scope: {"failed": 1}).run()
+        self.per_user_importer("liang").run()
+        self.assertEqual(self.calls, [])
+        with closing(sqlite3.connect(self.root / "state" / "chen" / "imports.db")) as connection:
+            self.assertEqual(connection.execute("SELECT status FROM imports").fetchone(), ("INDEX_ERROR",))
+        self.per_user_importer("chen").run()
+        self.assertEqual(self.calls, ["chen"])
+
+    def test_pending_filter_rejects_other_user_even_with_injected_shared_db(self) -> None:
+        self.write("retry.txt", "retry from chen")
+        self.per_user_importer("chen", ingest=lambda _scope: {"failed": 1}).run()
+        shared = self.root / "state" / "chen" / "imports.db"
+        liang = self.per_user_importer("liang")
+        liang.state_db_path = shared  # Deliberate Python API misuse; pending still stays scoped.
+        liang.run()
+        self.assertEqual(self.calls, [])
+
+    def test_different_uploader_locks_do_not_block_each_other(self) -> None:
+        chen = self.per_user_importer("chen")
+        liang = self.per_user_importer("liang")
+        with ki.ImporterLock(chen.lock_path):
+            with ki.ImporterLock(liang.lock_path):
+                self.assertNotEqual(chen.lock_path, liang.lock_path)
+
+    def test_same_uploader_lock_remains_exclusive(self) -> None:
+        first = self.per_user_importer("chen")
+        second = self.per_user_importer("chen")
+        with ki.ImporterLock(first.lock_path):
+            with self.assertRaises(ki.ImporterBusy):
+                second.run()
+
+    def test_selected_uploader_dry_run_does_not_touch_state_or_other_inbox(self) -> None:
+        own = self.write("own.txt", "own content")
+        other = self.write("other.txt", "other content", user="liang", kind="shared")
+        result = self.per_user_importer("chen", dry_run=True).run()
+        self.assertEqual([row.status for row in result], ["WOULD_IMPORT"])
+        self.assertTrue(own.exists())
+        self.assertTrue(other.exists())
+        self.assertFalse((self.root / "state" / "chen").exists())
+
+    def test_cli_forwards_uploader_without_arbitrary_path_flags(self) -> None:
+        with patch.object(ki, "load_policy", return_value=self.load_policy()):
+            with patch.object(ki, "KnowledgeImporter") as importer_type:
+                importer_type.return_value.run.return_value = []
+                self.assertEqual(ki.main(["--uploader", "chen", "--once"]), 0)
+                self.assertEqual(importer_type.call_args.kwargs["uploader"], "chen")
+
+    def test_cli_unknown_uploader_aborts_without_running(self) -> None:
+        with patch.object(ki, "load_policy", return_value=self.load_policy()):
+            with patch.object(ki.KnowledgeImporter, "run") as run:
+                self.assertEqual(ki.main(["--uploader", "nobody"]), 1)
+                run.assert_not_called()
+
+    def test_no_uploader_keeps_legacy_single_instance_defaults(self) -> None:
+        importer = ki.KnowledgeImporter(self.load_policy(), dry_run=True)
+        self.assertEqual(importer.state_db_path, ki.STATE_DB_PATH)
+        self.assertEqual(importer.lock_path, ki.LOCK_PATH)
 
 
 if __name__ == "__main__":

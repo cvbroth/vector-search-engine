@@ -22,7 +22,7 @@
         "destination": "/srv/storage/knowledge/shared/family"
       }
     },
-    "ziling": {
+    "azl": {
       "private": { "enabled": false },
       "shared": {
         "enabled": true,
