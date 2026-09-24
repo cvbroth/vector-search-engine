@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
 import logging
@@ -602,8 +603,23 @@ class KnowledgeImporter:
         _fsync_directory(candidate.path.parent)
         return target
 
-    def _publish(self, candidate: Candidate, data: bytes, sha256: str, destination: Path, import_id: str) -> Path:
-        """Fsync a same-directory temp, then rename without replacing final."""
+    def _fallback_rename_while_locked(self, temporary: Path, final: Path) -> None:
+        """Checked ordinary rename for this trusted, per-scope-locked path only."""
+        # lstat sees symlinks too; either kind of existing target is a conflict.
+        # This is cooperative no-clobber, not the kernel RENAME_NOREPLACE guarantee.
+        try:
+            final.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            raise FileExistsError(errno.EEXIST, "publication target already exists", str(final))
+        os.rename(temporary, final)
+
+    def _publish(self, candidate: Candidate, data: bytes, sha256: str, destination: Path, import_id: str,
+                 *, publication_locked: bool) -> Path:
+        """Publish only while the per-scope lock covers duplicate check and rename."""
+        if not publication_locked:
+            raise RuntimeError("publication requires the per-scope publish lock")
         if not self._stable(candidate):
             raise UnstableInput("candidate changed before publish")
         _unused, current_sha = _read_candidate(candidate, self.policy.max_file_size_bytes, collect=False)
@@ -621,7 +637,13 @@ class KnowledgeImporter:
                 if os.name != "nt":
                     os.fchmod(target.fileno(), 0o640)
                 os.fsync(target.fileno())
-            self.publication_primitive(temporary, final)
+            try:
+                self.publication_primitive(temporary, final)
+            except UnsupportedPublicationError:
+                # Only this trusted Importer path may use ordinary rename. Its
+                # no-clobber guarantee is cooperative: every Source writer must
+                # honor the same per-scope publish.lock held by _process().
+                self._fallback_rename_while_locked(temporary, final)
         finally:
             temporary.unlink(missing_ok=True)
         _fsync_directory(destination)
@@ -645,14 +667,15 @@ class KnowledgeImporter:
     def _process(self, candidate: Candidate, store: ImportStore | None) -> ImportRecord:
         route = self.policy.routes[candidate.uploader][candidate.kind]
         if self.dry_run or not route.enabled:
-            return self._process_candidate(candidate, store)
+            return self._process_candidate(candidate, store, publication_locked=False)
         assert route.scope is not None
         # Held across source duplicate check and publication, then released
         # before _index_pending() calls ingest_scope() and its own scope lock.
         with scope_file_lock(self.publication_lock_paths[route.scope]):
-            return self._process_candidate(candidate, store)
+            return self._process_candidate(candidate, store, publication_locked=True)
 
-    def _process_candidate(self, candidate: Candidate, store: ImportStore | None) -> ImportRecord:
+    def _process_candidate(self, candidate: Candidate, store: ImportStore | None,
+                           *, publication_locked: bool) -> ImportRecord:
         started = time.perf_counter()
         record = self._new_record(candidate)
         if store is not None:
@@ -669,14 +692,15 @@ class KnowledgeImporter:
                 route = self.policy.routes[candidate.uploader][candidate.kind]
                 assert route.destination is not None and data is not None and record.sha256 is not None
                 try:
-                    final = self._publish(candidate, data, record.sha256, route.destination, record.import_id)
+                    final = self._publish(candidate, data, record.sha256, route.destination, record.import_id,
+                                          publication_locked=publication_locked)
                 except FileExistsError:
                     record.status = _duplicate_or_conflict(route.destination, candidate.path.name, record.sha256) or "CONFLICT"
                     record.error_code = record.status
                 except UnsupportedPublicationError:
                     record.status = "VALIDATING"
                     record.error_code = "UNSUPPORTED_PUBLICATION"
-                    record.error_message = "atomic no-replace rename unavailable; Inbox entry retained"
+                    record.error_message = "publication rename unavailable; Inbox entry retained"
                     store.update(record)
                     raise
                 except OSError:

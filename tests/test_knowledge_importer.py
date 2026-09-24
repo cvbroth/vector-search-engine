@@ -128,7 +128,8 @@ class ImporterTests(unittest.TestCase):
             sleep_function=(lambda _seconds: None) if sleep is None else sleep,
         )
 
-    def per_user_importer(self, uploader: str, *, dry_run: bool = False, ingest=None) -> ki.KnowledgeImporter:
+    def per_user_importer(self, uploader: str, *, dry_run: bool = False, ingest=None,
+                          publication_primitive=None) -> ki.KnowledgeImporter:
         def good_ingest(scope: str) -> dict[str, int]:
             self.calls.append(scope)
             return {"failed": 0}
@@ -143,6 +144,7 @@ class ImporterTests(unittest.TestCase):
                 "chen": self.root / "scope-chen" / "publish.lock",
                 "family": self.root / "scope-family" / "publish.lock",
             },
+            publication_primitive=ki.rename_noreplace if publication_primitive is None else publication_primitive,
             ingest_function=good_ingest if ingest is None else ingest,
             sleep_function=lambda _seconds: None,
         )
@@ -563,12 +565,12 @@ class ImporterTests(unittest.TestCase):
         outcomes: list[ki.ImportRecord] = []
         errors: list[Exception] = []
 
-        def slow_publish(importer, *args):
+        def slow_publish(importer, *args, **kwargs):
             if args[0].uploader == "chen":
                 first_publishing.set()
                 if not release_first.wait(5):
                     raise TimeoutError("test publication wait timed out")
-            return original_publish(importer, *args)
+            return original_publish(importer, *args, **kwargs)
 
         def run_user(user: str) -> None:
             try:
@@ -628,6 +630,82 @@ class ImporterTests(unittest.TestCase):
         with patch.object(ki.os, "link", side_effect=AssertionError("hard-link publication forbidden")):
             self.assertEqual(self.importer().run()[0].status, "INDEXED")
 
+    def test_supported_primitive_does_not_use_fallback(self) -> None:
+        self.write("new.txt", "published contents")
+        with patch.object(ki.KnowledgeImporter, "_fallback_rename_while_locked",
+                          side_effect=AssertionError("unexpected fallback")):
+            self.assertEqual(self.importer().run()[0].status, "INDEXED")
+
+    def test_private_publish_rejects_call_without_scope_lock(self) -> None:
+        self.write("new.txt", "published contents")
+        importer = self.importer()
+        candidate = importer._scan()[0]
+        with self.assertRaisesRegex(RuntimeError, "publish lock"):
+            importer._publish(candidate, b"published contents", "unused", self.chen, "test",
+                              publication_locked=False)
+        self.assertFalse((self.chen / "new.txt").exists())
+
+    def test_mergerfs_einval_uses_locked_fallback_with_single_link(self) -> None:
+        self.write("new.txt", "published contents")
+
+        def unsupported(_temporary: Path, final: Path) -> None:
+            raise ki.UnsupportedPublicationError(errno.EINVAL, "simulated mergerfs EINVAL", str(final))
+
+        with patch.object(ki.os, "link", side_effect=AssertionError("hard link forbidden")):
+            result = self.importer(publication_primitive=unsupported).run()[0]
+        final = self.chen / "new.txt"
+        self.assertEqual(result.status, "INDEXED")
+        self.assertEqual(final.read_text(encoding="utf-8"), "published contents")
+        self.assertEqual(final.stat().st_nlink, 1)
+        self.assertEqual(list(self.chen.glob(".import-*.tmp")), [])
+
+    def test_fallback_rechecks_existing_final_without_overwriting(self) -> None:
+        self.write("race.txt", "incoming content")
+
+        def unsupported(_temporary: Path, final: Path) -> None:
+            final.write_text("other writer", encoding="utf-8")
+            raise ki.UnsupportedPublicationError(errno.EINVAL, "unsupported", str(final))
+
+        result = self.importer(publication_primitive=unsupported).run()[0]
+        self.assertEqual((result.status, result.error_code), ("CONFLICT", "CONFLICT"))
+        self.assertEqual((self.chen / "race.txt").read_text(encoding="utf-8"), "other writer")
+        self.assertEqual(list(self.chen.glob(".import-*.tmp")), [])
+
+    def test_fallback_rejects_symlink_final(self) -> None:
+        target = self.root / "outside.txt"
+        target.write_text("outside content", encoding="utf-8")
+        probe = self.root / "symlink-probe"
+        try:
+            probe.symlink_to(target)
+            probe.unlink()
+        except (OSError, NotImplementedError):
+            self.skipTest("symlink creation unavailable")
+        self.write("race.txt", "incoming content")
+
+        def unsupported(_temporary: Path, final: Path) -> None:
+            final.symlink_to(target)
+            raise ki.UnsupportedPublicationError(errno.EINVAL, "unsupported", str(final))
+
+        result = self.importer(publication_primitive=unsupported).run()[0]
+        self.assertEqual((result.status, result.error_code), ("CONFLICT", "CONFLICT"))
+        self.assertTrue((self.chen / "race.txt").is_symlink())
+        self.assertEqual(target.read_text(encoding="utf-8"), "outside content")
+
+    def test_real_io_errors_never_use_fallback(self) -> None:
+        for code in (errno.EIO, errno.EPERM, errno.EROFS, errno.ENOSPC):
+            with self.subTest(code=code):
+                name = f"error-{code}.txt"
+                self.write(name, "incoming content")
+
+                def failing_rename(_temporary: Path, _final: Path) -> None:
+                    raise OSError(code, "simulated I/O failure")
+
+                with patch.object(ki.KnowledgeImporter, "_fallback_rename_while_locked",
+                                  side_effect=AssertionError("I/O failure must not fall back")):
+                    result = self.importer(publication_primitive=failing_rename).run()[0]
+                self.assertEqual((result.status, result.error_code), ("REJECTED", "PUBLISH_ERROR"))
+                self.assertFalse((self.chen / name).exists())
+
     def test_eexist_race_maps_to_conflict_without_overwriting(self) -> None:
         self.write("race.txt", "incoming content")
 
@@ -663,18 +741,69 @@ class ImporterTests(unittest.TestCase):
         self.assertEqual((self.chen / "race.txt").read_text(encoding="utf-8"), "other writer")
         self.assertEqual(list(self.chen.glob(".import-*.tmp")), [])
 
-    def test_unsupported_rename_aborts_and_retains_inbox(self) -> None:
-        incoming = self.write("new.txt", "incoming content")
+    def test_unsupported_rename_falls_back_only_inside_scope_lock(self) -> None:
+        self.write("new.txt", "incoming content")
+        active = False
+        original_lock = ki.scope_file_lock
+
+        @contextmanager
+        def tracked_lock(path: Path):
+            nonlocal active
+            with original_lock(path):
+                active = True
+                try:
+                    yield
+                finally:
+                    active = False
 
         def unsupported(_temporary: Path, final: Path) -> None:
+            self.assertTrue(active)
             raise ki.UnsupportedPublicationError(errno.EOPNOTSUPP, "unsupported", str(final))
 
-        with self.assertRaises(ki.UnsupportedPublicationError):
-            self.importer(publication_primitive=unsupported).run()
-        self.assertTrue(incoming.exists())
-        self.assertFalse((self.chen / "new.txt").exists())
-        self.assertEqual(list(self.chen.glob(".import-*.tmp")), [])
-        self.assertEqual(self.rows()[0]["error_code"], "UNSUPPORTED_PUBLICATION")
+        with patch.object(ki, "scope_file_lock", tracked_lock):
+            self.assertEqual(self.importer(publication_primitive=unsupported).run()[0].status, "INDEXED")
+        self.assertFalse(active)
+        self.assertEqual((self.chen / "new.txt").read_text(encoding="utf-8"), "incoming content")
+
+    def test_concurrent_fallback_publishers_serialize_same_scope(self) -> None:
+        self.write("chen.txt", "same shared bytes", kind="shared")
+        self.write("liang.txt", "same shared bytes", user="liang", kind="shared")
+        entered = threading.Event()
+        release = threading.Event()
+        outcomes: list[ki.ImportRecord] = []
+        errors: list[Exception] = []
+
+        def unsupported(_temporary: Path, final: Path) -> None:
+            if final.name == "chen.txt":
+                entered.set()
+                if not release.wait(5):
+                    raise TimeoutError("test publication wait timed out")
+            raise ki.UnsupportedPublicationError(errno.EINVAL, "simulated mergerfs EINVAL", str(final))
+
+        def run_user(user: str) -> None:
+            try:
+                outcomes.extend(self.per_user_importer(user, publication_primitive=unsupported).run())
+            except Exception as exc:
+                errors.append(exc)
+
+        chen_thread = threading.Thread(target=run_user, args=("chen",))
+        liang_thread = threading.Thread(target=run_user, args=("liang",))
+        chen_thread.start()
+        try:
+            self.assertTrue(entered.wait(5))
+            liang_thread.start()
+            time.sleep(0.1)
+        finally:
+            release.set()
+            chen_thread.join(5)
+            if liang_thread.ident is not None:
+                liang_thread.join(5)
+        self.assertFalse(chen_thread.is_alive() or liang_thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(sorted(item.status for item in outcomes), ["DUPLICATE", "INDEXED"])
+        published = list(self.family.glob("*.txt"))
+        self.assertEqual(len(published), 1)
+        self.assertEqual(published[0].stat().st_nlink, 1)
 
     @unittest.skipUnless(sys.platform == "linux", "read_snapshot uses Linux directory-FD flags")
     def test_ingest_reads_newly_published_single_link_file(self) -> None:
@@ -682,6 +811,19 @@ class ImporterTests(unittest.TestCase):
 
         self.write("new.txt", "immediately readable")
         self.assertEqual(self.importer().run()[0].status, "INDEXED")
+        snapshot = ingest.read_snapshot(self.chen / "new.txt", SimpleNamespace(source_dir=self.chen))
+        self.assertEqual(snapshot.data, b"immediately readable")
+
+    @unittest.skipUnless(sys.platform == "linux", "read_snapshot uses Linux directory-FD flags")
+    def test_ingest_reads_fallback_published_file_immediately(self) -> None:
+        import ingest
+
+        self.write("new.txt", "immediately readable")
+
+        def unsupported(_temporary: Path, final: Path) -> None:
+            raise ki.UnsupportedPublicationError(errno.EINVAL, "simulated mergerfs EINVAL", str(final))
+
+        self.assertEqual(self.importer(publication_primitive=unsupported).run()[0].status, "INDEXED")
         snapshot = ingest.read_snapshot(self.chen / "new.txt", SimpleNamespace(source_dir=self.chen))
         self.assertEqual(snapshot.data, b"immediately readable")
 
