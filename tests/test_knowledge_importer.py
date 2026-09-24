@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import io
+import errno
 import hashlib
 import json
 import os
 import sqlite3
 import stat
+import sys
 import tempfile
 import threading
 import time
@@ -15,6 +17,7 @@ import unittest
 from contextlib import closing, contextmanager
 from contextlib import redirect_stderr
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from docx import Document
@@ -108,7 +111,7 @@ class ImporterTests(unittest.TestCase):
         path.write_bytes(data.encode("utf-8") if isinstance(data, str) else data)
         return path
 
-    def importer(self, *, dry_run: bool = False, sleep=None, ingest=None) -> ki.KnowledgeImporter:
+    def importer(self, *, dry_run: bool = False, sleep=None, ingest=None, publication_primitive=None) -> ki.KnowledgeImporter:
         def good_ingest(scope: str) -> dict[str, int]:
             self.calls.append(scope)
             return {"added": 1, "updated": 0, "skipped": 0, "deleted": 0, "failed": 0}
@@ -120,6 +123,7 @@ class ImporterTests(unittest.TestCase):
                 "chen": self.root / "scope-chen" / "publish.lock",
                 "family": self.root / "scope-family" / "publish.lock",
             },
+            publication_primitive=ki.rename_noreplace if publication_primitive is None else publication_primitive,
             ingest_function=good_ingest if ingest is None else ingest,
             sleep_function=(lambda _seconds: None) if sleep is None else sleep,
         )
@@ -611,6 +615,75 @@ class ImporterTests(unittest.TestCase):
 
         with patch.object(ki, "scope_file_lock", tracked_lock):
             self.assertEqual(self.importer(ingest=ingest_after_publication).run()[0].status, "INDEXED")
+
+    def test_publication_is_single_linked_and_cleans_temporary(self) -> None:
+        self.write("new.txt", "published contents")
+        result = self.importer().run()[0]
+        self.assertEqual(result.status, "INDEXED")
+        self.assertEqual((self.chen / "new.txt").stat().st_nlink, 1)
+        self.assertEqual(list(self.chen.glob(".import-*.tmp")), [])
+
+    def test_publication_never_uses_hard_link(self) -> None:
+        self.write("new.txt", "published contents")
+        with patch.object(ki.os, "link", side_effect=AssertionError("hard-link publication forbidden")):
+            self.assertEqual(self.importer().run()[0].status, "INDEXED")
+
+    def test_eexist_race_maps_to_conflict_without_overwriting(self) -> None:
+        self.write("race.txt", "incoming content")
+
+        def competing_writer(_temporary: Path, final: Path) -> None:
+            final.write_text("other writer", encoding="utf-8")
+            raise FileExistsError(errno.EEXIST, "already exists", str(final))
+
+        result = self.importer(publication_primitive=competing_writer).run()[0]
+        self.assertEqual((result.status, result.error_code), ("CONFLICT", "CONFLICT"))
+        self.assertEqual((self.chen / "race.txt").read_text(encoding="utf-8"), "other writer")
+        self.assertEqual(list(self.chen.glob(".import-*.tmp")), [])
+
+    def test_eexist_race_maps_to_duplicate_for_same_content(self) -> None:
+        self.write("race.txt", "incoming content")
+
+        def competing_writer(temporary: Path, final: Path) -> None:
+            final.write_bytes(temporary.read_bytes())
+            raise FileExistsError(errno.EEXIST, "already exists", str(final))
+
+        result = self.importer(publication_primitive=competing_writer).run()[0]
+        self.assertEqual((result.status, result.error_code), ("DUPLICATE", "DUPLICATE"))
+        self.assertEqual(list(self.chen.glob(".import-*.tmp")), [])
+
+    def test_rename_failure_keeps_competing_final_and_cleans_own_temp(self) -> None:
+        self.write("race.txt", "incoming content")
+
+        def failing_rename(_temporary: Path, final: Path) -> None:
+            final.write_text("other writer", encoding="utf-8")
+            raise OSError(errno.EIO, "simulated rename failure")
+
+        result = self.importer(publication_primitive=failing_rename).run()[0]
+        self.assertEqual((result.status, result.error_code), ("REJECTED", "PUBLISH_ERROR"))
+        self.assertEqual((self.chen / "race.txt").read_text(encoding="utf-8"), "other writer")
+        self.assertEqual(list(self.chen.glob(".import-*.tmp")), [])
+
+    def test_unsupported_rename_aborts_and_retains_inbox(self) -> None:
+        incoming = self.write("new.txt", "incoming content")
+
+        def unsupported(_temporary: Path, final: Path) -> None:
+            raise ki.UnsupportedPublicationError(errno.EOPNOTSUPP, "unsupported", str(final))
+
+        with self.assertRaises(ki.UnsupportedPublicationError):
+            self.importer(publication_primitive=unsupported).run()
+        self.assertTrue(incoming.exists())
+        self.assertFalse((self.chen / "new.txt").exists())
+        self.assertEqual(list(self.chen.glob(".import-*.tmp")), [])
+        self.assertEqual(self.rows()[0]["error_code"], "UNSUPPORTED_PUBLICATION")
+
+    @unittest.skipUnless(sys.platform == "linux", "read_snapshot uses Linux directory-FD flags")
+    def test_ingest_reads_newly_published_single_link_file(self) -> None:
+        import ingest
+
+        self.write("new.txt", "immediately readable")
+        self.assertEqual(self.importer().run()[0].status, "INDEXED")
+        snapshot = ingest.read_snapshot(self.chen / "new.txt", SimpleNamespace(source_dir=self.chen))
+        self.assertEqual(snapshot.data, b"immediately readable")
 
 
 if __name__ == "__main__":

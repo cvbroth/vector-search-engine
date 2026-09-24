@@ -20,6 +20,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Callable, Mapping
 
+from atomic_publish import UnsupportedPublicationError, rename_noreplace
 from config import KNOWLEDGE_SCOPES, SUPPORTED_SUFFIXES, reject_symlink_components
 from ingest import ingest_scope
 from parsers import ParseError, parse_document
@@ -467,6 +468,7 @@ class KnowledgeImporter:
         state_db_path: Path | None = None,
         lock_path: Path | None = None,
         publication_lock_paths: Mapping[str, Path] | None = None,
+        publication_primitive: Callable[[Path, Path], None] = rename_noreplace,
         settle_seconds: float = DEFAULT_SETTLE_SECONDS,
         dry_run: bool = False,
         ingest_function: Callable[[str], Mapping[str, int]] = ingest_scope,
@@ -490,6 +492,7 @@ class KnowledgeImporter:
             {name: scope.state_dir / "publish.lock" for name, scope in KNOWLEDGE_SCOPES.items()}
             if publication_lock_paths is None else publication_lock_paths
         )
+        self.publication_primitive = publication_primitive
         self.settle_seconds = settle_seconds
         self.dry_run = dry_run
         self.ingest_function = ingest_function
@@ -600,7 +603,7 @@ class KnowledgeImporter:
         return target
 
     def _publish(self, candidate: Candidate, data: bytes, sha256: str, destination: Path, import_id: str) -> Path:
-        """Fsync a same-directory temp, then atomically link without clobbering final."""
+        """Fsync a same-directory temp, then rename without replacing final."""
         if not self._stable(candidate):
             raise UnstableInput("candidate changed before publish")
         _unused, current_sha = _read_candidate(candidate, self.policy.max_file_size_bytes, collect=False)
@@ -618,8 +621,7 @@ class KnowledgeImporter:
                 if os.name != "nt":
                     os.fchmod(target.fileno(), 0o640)
                 os.fsync(target.fileno())
-            os.link(temporary, final)
-            _fsync_directory(destination)
+            self.publication_primitive(temporary, final)
         finally:
             temporary.unlink(missing_ok=True)
         _fsync_directory(destination)
@@ -671,6 +673,12 @@ class KnowledgeImporter:
                 except FileExistsError:
                     record.status = _duplicate_or_conflict(route.destination, candidate.path.name, record.sha256) or "CONFLICT"
                     record.error_code = record.status
+                except UnsupportedPublicationError:
+                    record.status = "VALIDATING"
+                    record.error_code = "UNSUPPORTED_PUBLICATION"
+                    record.error_message = "atomic no-replace rename unavailable; Inbox entry retained"
+                    store.update(record)
+                    raise
                 except OSError:
                     final = route.destination / candidate.path.name
                     try:

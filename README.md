@@ -16,6 +16,7 @@
 | `kb_service.py` | 仅通过宿主机 Unix socket 提供只读 RAG Context 查询接口 |
 | `kb_policy_broker.py` | 宿主机中央授权 Broker；按 Agent 和工具类型解析 scope 并转发到查询后端 |
 | `knowledge_importer.py` | 根据独立 policy 将稳定 Inbox 文档验证、去重、发布到正式 Source，再批量调用既有增量索引 |
+| `atomic_publish.py` | Linux `renameat2(RENAME_NOREPLACE)` 的隔离封装；不支持时明确失败 |
 | `scope_lock.py` | 为同一知识库 scope 的发布和索引提供独立文件锁 |
 | `examples/knowledge-broker-policy.json` | Broker policy 示例；真实 policy 应单独放在 `/etc/knowledge-broker/policy.json` |
 | `examples/knowledge-import-policy.json` | Importer policy 示例；真实账号和目录须由部署者核对 |
@@ -256,7 +257,7 @@ OpenClaw 插件只请求 Broker socket，模型仅看到 `knowledge_private(quer
 
 去重键是**目标 scope + 流式 SHA-256**，不跨 private/shared 全局去重；即使 Source 文件早于 Importer 已存在，也检查 Source 原文件。普通且在大小上限内的候选逐块计算 SHA；空文件记录空内容 SHA，超限或非普通文件不读取/哈希。同 scope 相同内容判 `DUPLICATE`，同名不同内容判 `CONFLICT`，均不写 Source、不自动改名或覆盖，原 Inbox 文件移至 `<user>/rejected/<kind>/<status>/<import_id>__<original_filename>`。其他拒绝文件也按状态保留在那里，不静默删除；如果隔离移动失败，原 Inbox 文件仍保留并在元数据中标记。导入审计和日志不记录正文；日志仅记 ID、上传者、类别、scope、文件名、大小、SHA 前缀、状态与耗时。当前 `parsers.py` 接收内存中的字节快照，因此解析接近大小上限的文件仍需相应内存；上线前应按机器内存评估 policy 上限。
 
-正式发布使用目标目录内独占临时文件：写入后对打开的文件描述符显式 `fchmod(0640)` 并 `fsync`，再以不覆盖现有 final 名称的原子硬链接发布，清理临时文件后才移除原 Inbox 文件。final Source 因此在 Linux 上为 `0640`，不依赖服务的 `UMask=0077`；Importer **不 chmod Inbox 原文件**。private Source 的目录访问控制仍由其私有目录决定；shared Source 能否被其他用户读取，还取决于目录遍历权限、属组与 setgid/ACL。这种复制到目标目录的方式也适用于 Inbox 与 Source 不在同一 filesystem；中途失败不会把半写入内容作为 final 文件暴露。真实 NAS 的 mergerfs/FUSE 是否允许该目录中的硬链接和目录 `fsync`、权限及容量，**仍需在部署前实测**。每个 uploader 使用自己的 `/run/knowledge-import/<uploader>/import.lock` 独占锁：同一用户不能并发导入，不同用户的锁互不阻塞；Linux 使用 `fcntl.flock`。运行用户必须控制自己的锁目录和 Importer DB 目录。
+正式发布使用目标目录内独占临时文件：写入后对打开的文件描述符显式 `fchmod(0640)` 并 `fsync`，然后在 Linux 上用 `renameat2(RENAME_NOREPLACE)` 将同目录 temp 原子改名为 final，最后 `fsync` 目标目录。final 从首次可见起就是单链接普通文件（`st_nlink == 1`），不会出现旧版 `link + unlink` 的瞬时双链接窗口；目标已有同名文件时内核拒绝替换，仍按原有 duplicate/conflict 规则处理。Importer **不 chmod Inbox 原文件**。private Source 的目录访问控制仍由其私有目录决定；shared Source 能否被其他用户读取，还取决于目录遍历权限、属组与 setgid/ACL。这种先复制到目标目录的方式也适用于 Inbox 与 Source 不在同一 filesystem；中途失败不会把半写入内容作为 final 文件暴露。若 Linux libc、内核或底层文件系统不支持该 no-replace 原语，导入明确中止并保留原 Inbox 文件，绝不退回到可能覆盖目标的普通 rename/replace 或旧版 hard-link 发布。真实 NAS 的 mergerfs/FUSE 对 `RENAME_NOREPLACE`、目录 `fsync`、权限及容量的支持，**仍需在部署前实测**。每个 uploader 使用自己的 `/run/knowledge-import/<uploader>/import.lock` 独占锁：同一用户不能并发导入，不同用户的锁互不阻塞；Linux 使用 `fcntl.flock`。运行用户必须控制自己的锁目录和 Importer DB 目录。
 
 同一 scope 还有两把用途不同的锁：`<scope.state_dir>/publish.lock` 保护 Source 中的 **SHA-256 去重检查到 final 发布**，避免不同 uploader 以不同文件名同时发布相同内容；`<scope.state_dir>/ingest.lock` 由 `ingest_scope()` 自己持有，覆盖完整的扫描、SQLite 更新和删除阶段，因此 Importer、既有 ingest timer、手动 CLI 等调用方都受同一把锁约束。实际路径分别位于 `/var/lib/knowledge-base/private/chen/` 或 `/var/lib/knowledge-base/shared/family/` 下。锁顺序为「每用户 Importer 锁 → scope 发布锁 → 释放发布锁 → scope ingest 锁」，不会嵌套持有两个 scope 锁。锁文件只是持久的同步入口，不以文件存在与否判断占用；进程退出后内核释放 `flock`。所有参与者必须使用同一可信 state 目录和这些锁；手工绕过 Importer 直接写 Source 不受发布锁保护。
 
