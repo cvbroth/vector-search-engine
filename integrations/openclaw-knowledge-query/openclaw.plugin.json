@@ -1,7 +1,7 @@
 {
   "id": "local-knowledge-query",
   "name": "Local Knowledge Query",
-  "description": "Read-only private and household-shared NAS knowledge tools via the local policy broker.",
+  "description": "Private and household-shared NAS query and trusted-attachment import tools.",
   "version": "0.1.0",
   "configSchema": {
     "type": "object",
@@ -10,6 +10,27 @@
     ],
     "properties": {
       "agents": {
+        "type": "object",
+        "patternProperties": {
+          "^.*$": {
+            "type": "object",
+            "required": [
+              "private",
+              "shared"
+            ],
+            "properties": {
+              "private": {
+                "type": "boolean"
+              },
+              "shared": {
+                "type": "boolean"
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "imports": {
         "type": "object",
         "patternProperties": {
           "^.*$": {
@@ -39,7 +60,9 @@
   "contracts": {
     "tools": [
       "knowledge_private",
-      "knowledge_shared"
+      "knowledge_shared",
+      "knowledge_import_private",
+      "knowledge_import_shared"
     ]
   }
 }

@@ -28,7 +28,7 @@ function context(status = "ACCEPT", query = "问题") {
 
 function factories(pluginConfig = config) {
   const found = new Map();
-  plugin.register({ pluginConfig, registerTool(value, options) { found.set(options.name, value); } });
+  plugin.register({ pluginConfig, registerTool(value, options) { found.set(options.name, value); }, on() {} });
   return found;
 }
 
@@ -69,10 +69,11 @@ function send(response, payload, status = 200) {
   response.end(JSON.stringify(payload));
 }
 
-test("exactly two tools, with model schema limited to query and top_k", () => {
+test("query schemas remain limited to query and top_k", () => {
   const found = factories();
-  assert.deepEqual([...found.keys()], ["knowledge_private", "knowledge_shared"]);
-  for (const factory of found.values()) {
+  assert.deepEqual([...found.keys()], ["knowledge_private", "knowledge_shared", "knowledge_import_private", "knowledge_import_shared"]);
+  for (const name of ["knowledge_private", "knowledge_shared"]) {
+    const factory = found.get(name);
     const tool = factory({ agentId: "chenAgent" });
     assert.deepEqual(Object.keys(tool.parameters.properties), ["query", "top_k"]);
     for (const forbidden of ["agent_id", "agentId", "scope", "scopes", "database", "source_path", "socketPath", "url", "host", "port"]) {
@@ -205,8 +206,8 @@ test("timeout, cancellation, and oversized response are transport errors", async
 test("plugin metadata and source contain no shell or arbitrary URL client", async () => {
   const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
   const manifest = JSON.parse(await readFile(path.join(root, "openclaw.plugin.json"), "utf8"));
-  assert.deepEqual(manifest.contracts.tools, ["knowledge_private", "knowledge_shared"]);
-  for (const name of ["index.ts", "unix-client.ts"]) {
+  assert.deepEqual(manifest.contracts.tools, ["knowledge_private", "knowledge_shared", "knowledge_import_private", "knowledge_import_shared"]);
+  for (const name of ["index.ts", "unix-client.ts", "import-client.ts", "attachment-registry.ts"]) {
     const source = await readFile(path.join(root, "src", name), "utf8");
     assert.doesNotMatch(source, /child_process|\bexecFile\b|\bspawn\s*\(|\bexec\s*\(/);
   }

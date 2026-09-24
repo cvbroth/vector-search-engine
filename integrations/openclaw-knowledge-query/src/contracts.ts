@@ -8,6 +8,10 @@ export const configSchema = Type.Object(
       private: Type.Boolean(),
       shared: Type.Boolean(),
     }, { additionalProperties: false })),
+    imports: Type.Optional(Type.Record(Type.String(), Type.Object({
+      private: Type.Boolean(),
+      shared: Type.Boolean(),
+    }, { additionalProperties: false }))),
   },
   { additionalProperties: false },
 );
@@ -57,3 +61,19 @@ export const staticParameters = Type.Object(
   },
   { additionalProperties: false },
 );
+
+export const importParameters = Type.Object({}, { additionalProperties: false });
+
+export const importResultSchema = Type.Object({
+  status: Type.Union([
+    Type.Literal("QUEUED"), Type.Literal("NO_ATTACHMENT"),
+    Type.Literal("SELECTION_REQUIRED"), Type.Literal("UNSUPPORTED_TYPE"),
+    Type.Literal("ATTACHMENT_CHANGED"), Type.Literal("TOO_LARGE"),
+    Type.Literal("ALREADY_QUEUED"), Type.Literal("BROKER_ERROR"),
+  ]),
+  filename: Type.Optional(Type.String()),
+  content_type: Type.Optional(Type.String()),
+  size_bytes: Type.Optional(Type.Integer({ minimum: 0 })),
+  sha256_prefix: Type.Optional(Type.String()),
+  access_kind: Type.Optional(Type.Union([Type.Literal("private"), Type.Literal("shared")])),
+}, { additionalProperties: false });

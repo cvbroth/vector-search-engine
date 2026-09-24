@@ -1,6 +1,6 @@
 # OpenClaw 本地知识库 Tool Plugin
 
-插件只向模型提供两个工具：`knowledge_private(query, top_k?)`（当前 Agent 的私人知识）和 `knowledge_shared(query, top_k?)`（家庭共享知识）。二者的模型参数 schema 均严格为 `query`（1–4096 个 Unicode 字符）和可选 `top_k`（1–10，默认 5），`additionalProperties=false`。不提供 `agent_id`、`agentId`、`scope`、`scopes`、数据库、文件或网络地址参数，也不再提供旧的 `knowledge_query`。
+插件保留两个查询工具：`knowledge_private(query, top_k?)`（当前 Agent 的私人知识）和 `knowledge_shared(query, top_k?)`（家庭共享知识）。二者的模型参数 schema 均严格为 `query`（1–4096 个 Unicode 字符）和可选 `top_k`（1–10，默认 5），`additionalProperties=false`。另新增两个按需排队工具 `knowledge_import_private()` / `knowledge_import_shared()`，其模型参数严格为 `{}`。不提供 `agent_id`、`agentId`、`scope`、`scopes`、数据库、文件或网络地址参数，也不再提供旧的 `knowledge_query`。
 
 ```text
 模型 → knowledge_private / knowledge_shared
@@ -12,7 +12,7 @@
      → Broker 严格校验并去除内部 scope/path → 模型侧 Context JSON
 ```
 
-插件只用 Node 内置 `http.request({socketPath})` 对 Broker 发请求，不调用 shell、其他命令行客户端、NAS 文件或 SQLite，也不提供 TCP/任意 URL。私人/共享分别固定调用 `POST /v1/private-context` 与 `POST /v1/shared-context`。`agent_id` 由插件从 OpenClaw 运行时上下文注入，绝不取自模型参数。
+查询插件只用 Node 内置 `http.request({socketPath})` 对 Query Broker 发请求，不调用 shell、其他命令行客户端、NAS 文件或 SQLite，也不提供 TCP/任意 URL。私人/共享分别固定调用 `POST /v1/private-context` 与 `POST /v1/shared-context`。`agent_id` 由插件从 OpenClaw 运行时上下文注入，绝不取自模型参数。导入工具只访问 OpenClaw 已暂存的可信附件，以及固定的 Import Broker Unix socket；不访问 NAS Inbox 或 Source。
 
 ## 构建和验证
 
@@ -27,6 +27,33 @@ pnpm run plugin:validate
 ```
 
 打包时保留 `dist/`、`package.json` 和 `openclaw.plugin.json`。本地测试与 manifest 验证不等于已在用户的 OpenClaw 容器部署或验证。
+
+## 可信附件导入（按需，尚未部署）
+
+OpenClaw 2026.9.4 的公开 `inbound_claim` Hook 类型提供 `event.media`（已暂存的本地附件路径）及 `event.mediaStagingPending`，Hook context 有可选 `agentId` / `sessionKey`。插件仅接受该 Hook 的 `media.path`；不用 `originalMedia`、URL、聊天文字中的路径或私有 bundle。公开媒体事实没有独立的原始文件名字段，目前以暂存路径 basename 作为文件名；若渠道暂存名不保留 `.pdf/.docx/.md/.txt` 扩展名，则拒绝而不是让模型覆写。缺少 Agent/会话键、暂存未完成时不登记 READY。Registry 是进程内状态：30 分钟 TTL，最多 100 个会话和每会话 8 个附件；Gateway 重启即失效。一次只自动选择最近一条**单附件**消息；多附件返回 `SELECTION_REQUIRED`，无附件返回 `NO_ATTACHMENT`。不会在聊天中主动建议入库。
+
+导入前重新核对暂存文件的 dev/inode/size/mtime，以 `O_NOFOLLOW` 打开并 `fstat` 已打开文件；仅允许 `.pdf`、`.docx`、`.md`、`.txt`，上限 100 MiB。正文以 raw HTTP body 流式发送到固定 `/run/knowledge-import-broker/import.sock`，不在 JSON 中 base64 编码。Broker 根据固定宿主机 policy 映射 `agentId` 到 NAS uploader，并只把附件排入其私人 Inbox；`QUEUED` **不代表已索引**。传输错误或响应不确定时返回 `BROKER_ERROR`，同一附件不会自动重发，需人工核对 Inbox。真实渠道是否提供可用 Hook 媒体路径、普通 rename/fsync 和所有目录权限，仍待服务器实测。
+
+查询可见性仍由 `agents` 配置决定；写入工具由**独立、可选**的 `imports` 配置决定。缺少 `imports` 时两个写入工具完全不暴露，旧配置不会获得写权限。示例：
+
+```json
+{
+  "agents": {
+    "main": {"private": true, "shared": true},
+    "chen": {"private": true, "shared": true},
+    "liang": {"private": false, "shared": true},
+    "ziling": {"private": false, "shared": true}
+  },
+  "imports": {
+    "main": {"private": true, "shared": true},
+    "chen": {"private": true, "shared": true},
+    "liang": {"private": false, "shared": true},
+    "ziling": {"private": false, "shared": true}
+  }
+}
+```
+
+插件配置只决定工具可见性；宿主机 Import Broker policy 才是最终授权与 `main→chen`、`ziling→azl` 等映射。禁止把 Inbox、Source、Query backend.sock 暴露给容器；只挂载必要的两个 Broker socket。中央 Import Broker 的示例 systemd 安全设置与身份边界见仓库根目录 README。
 
 ## 本地可见性与中央授权
 

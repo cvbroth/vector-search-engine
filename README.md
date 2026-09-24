@@ -16,10 +16,12 @@
 | `kb_service.py` | 仅通过宿主机 Unix socket 提供只读 RAG Context 查询接口 |
 | `kb_policy_broker.py` | 宿主机中央授权 Broker；按 Agent 和工具类型解析 scope 并转发到查询后端 |
 | `knowledge_importer.py` | 根据独立 policy 将稳定 Inbox 文档验证、去重、发布到正式 Source，再批量调用既有增量索引 |
+| `knowledge_import_broker.py` | 固定 Unix socket、宿主机 policy 授权，将可信附件字节流排队到映射用户的私人 Inbox；不解析或索引 |
 | `atomic_publish.py` | 严格的 Linux `renameat2(RENAME_NOREPLACE)` 隔离封装；底层原语本身不做降级 |
 | `scope_lock.py` | 为同一知识库 scope 的发布和索引提供独立文件锁 |
 | `examples/knowledge-broker-policy.json` | Broker policy 示例；真实 policy 应单独放在 `/etc/knowledge-broker/policy.json` |
 | `examples/knowledge-import-policy.json` | Importer policy 示例；真实账号和目录须由部署者核对 |
+| `examples/knowledge-import-broker-policy.json` | 独立的 Agent→NAS uploader 与导入权限 policy 示例 |
 | `clients/openclaw_kb_client.mjs` | 仅供可信宿主机诊断的旧式直接查询客户端；不可作为 Agent 授权入口 |
 | `integrations/openclaw-knowledge-query/` | 仅提供 `knowledge_private` / `knowledge_shared` 的 OpenClaw Tool Plugin |
 | `calibrate_relevance.py` | 用人工标注查询记录单库 Top1 诊断分数，汇总并扫描候选阈值；不参与生产搜索 |
@@ -318,6 +320,47 @@ WantedBy=timers.target
 每个私人 Inbox 应保持 `/srv/storage/ai-inbox/{chen,liang,azl}` 分别由同名 Unix 用户拥有，目录模式 `0700`；不要为方便 Importer 把所有 Inbox 改成 `0770`，也不要让 `chen` 读取 `liang` 的 Inbox。每个实例只需本人的 Inbox 读写、本人 state/runtime 目录和 policy 读取权限。`family` 共享 Source 目录须由 `nas-users` 等经审核的组持有、启用 setgid，并给予该组所需的目录遍历/读写权限；这样新发布的 `0640` 文件才能继承正确属组并供授权 indexer 读取。`UMask=0077` 可以继续保护其他私有状态，但不会覆盖 Source 的显式 `fchmod(0640)`。private Source 和 Inbox 的目录仍须保持私人访问控制。
 
 `family` 派生 state 目录 `/var/lib/knowledge-base/shared/family` 及 `index/`、`logs/` 也须预先按受信任组配置 setgid/权限，让所有获授权的 family ingest 用户能打开同一个 `0660` 锁文件并实际读写 SQLite 主库、日志及其临时/journal 文件。锁代码不会自动修复目录属组或数据库/日志的权限；`UMask=0077` 也可能使这些派生文件成为仅 owner 可读写。部署前必须在真实主机核验并设计受控 ACL/属组、SQLite 并发和 mergerfs 行为；若无法满足，不要启用多用户轮流执行 family ingest。不要靠放宽私人 Inbox 权限解决。服务用户无需 root。未来若加 OpenClaw 导入工具，可提供 `knowledge_import_private` / `knowledge_import_shared`，只接收可信 attachment handle；模型不应传任意路径、scope、agent_id 或 destination。本次没有实现 Import Broker、插件、Web 上传或 OCR。
+
+## 可信聊天附件排队（未部署）
+
+OpenClaw 2026.9.4 固定依赖的公开 Plugin SDK 提供 `inbound_claim` Hook：其 `event.media` 是暂存后的本地附件事实，`event.mediaStagingPending` 表示尚不可用，`ctx.agentId` / `ctx.sessionKey` 用于隔离。插件只登记该公开 Hook 的 `media.path`，不读取聊天文字中的路径，不使用 `originalMedia`、URL 或 `/app/dist` 私有接口。Hook 没有独立的原始文件名字段，因此目前取暂存路径的 basename 作为文件名；实际渠道若把暂存文件改成不带受支持扩展名的随机名，将返回 `UNSUPPORTED_TYPE`，不能靠模型覆写文件名。Hook 缺少受信任 Agent/会话键、附件仍在 staging、不是普通文件等情况均不登记 READY。实际渠道是否触发该 Hook、是否给出可读暂存路径和 Agent ID，仍须在 OpenClaw 真实容器内验证。
+
+新链路与查询链路独立：`knowledge_import_private()` / `knowledge_import_shared()` 的模型参数严格为 `{}`；工具从可信 `toolContext.agentId` 和 `toolContext.sessionKey` 选取当前会话最近一条单附件消息。多附件返回 `SELECTION_REQUIRED`，没有 READY 附件返回 `NO_ATTACHMENT`。进程内 Registry 最多保留 100 个会话、每会话最多 8 个附件、TTL 30 分钟；重启即丢失。已经发起传输的附件不会自动重发：超时可能意味着 Broker 已接收但响应丢失，工具返回 `BROKER_ERROR`，再次调用返回 `ALREADY_QUEUED`，需要人工核对 Inbox。此阶段**不会主动提示用户入库**，只在用户调用工具时排队。
+
+发送前插件对可信暂存路径 `lstat` 并以 `O_NOFOLLOW` 打开，核对打开 fd 的 dev/inode/size/mtime、普通文件类型、扩展名和 100 MiB 上限。附件正文走固定 Unix socket `/run/knowledge-import-broker/import.sock` 的 HTTP raw body 流，不使用 base64 JSON、不由模型指定路径、URL、scope、uploader 或目标。Broker 的独立固定 policy 示例是 [`examples/knowledge-import-broker-policy.json`](examples/knowledge-import-broker-policy.json)：`main`、`chen` 映射 `chen` 且允许 private/shared；`liang` 只允许 shared；`ziling` 映射 `azl` 且只允许 shared；未知 Agent 拒绝。Broker 的 `max_file_size_bytes` 必须不高于对应用户 Importer policy 的限制，当前示例均为 100 MiB。插件 `imports` 配置缺失时两个写入工具完全隐藏；现有 `agents.<id>.private/shared` 查询配置**不会自动继承写权限**。Broker policy 才是最终 ACL，插件配置仅是工具可见性控制。
+
+宿主机 Broker 只允许固定路由，把流式正文写入 `/srv/storage/ai-inbox/<policy 映射 uploader>/private|shared` 的同目录独占临时文件，计算 SHA-256，`fchown` 至目标 Unix 用户、`fchmod(0600)`、`fsync` 后改名为随机队列文件，再 `fsync` 目录。它不解析、不中转到 Source、不执行附件，也不触碰 SQLite、Embedding 或 ingest。`QUEUED` 只表示 Inbox 排队成功，**不是 `INDEXED`**；后续仍由现有 `knowledge_import@<user>.timer/service` 与 `knowledge_importer.py` 处理。单一 Broker 串行处理请求，随机 final 名并复查是否存在；普通 rename 的防碰撞依赖这个受控写入路径及私人 Inbox 的目录权限，不能防护绕过 Broker 的恶意并发写入者。不要将 Inbox、Source 或 backend.sock 挂载到 OpenClaw，只向容器提供 Import Broker socket。
+
+建议单独的宿主机 systemd 服务（**仅示例，尚未部署**）：
+
+```ini
+[Unit]
+Description=Knowledge attachment import broker
+After=local-fs.target
+
+[Service]
+Type=simple
+User=root
+Group=openclaw
+WorkingDirectory=/opt/knowledge-base
+ExecStart=/opt/knowledge-base/.venv/bin/python /opt/knowledge-base/knowledge_import_broker.py
+RuntimeDirectory=knowledge-import-broker
+RuntimeDirectoryMode=0750
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_UNIX
+ReadWritePaths=/srv/storage/ai-inbox /run/knowledge-import-broker
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+```
+
+中央 Broker 需要对 `chen`、`liang`、`azl` 的 `0700` Inbox 写入和 `chown`，因此示例使用受严格约束的 root 服务；真实部署时必须核实 `Group=openclaw`、容器映射 UID/GID、socket 属组/模式、systemd sandbox 与 mergerfs 上的目录 fsync/rename。policy 应由 root 管理并仅允许 Broker 读取。Unix socket 限制本机连接，但客户端提交的 `agent_id` 本身不是密码学身份：同 UID/组拥有任意代码执行能力的进程仍可能伪造它；若需强隔离，必须另设 per-agent 进程/UID 或可信身份通道。不要将此示例视为已在服务器运行成功。
 
 ## 相关度标定
 

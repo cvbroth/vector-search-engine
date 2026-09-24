@@ -1,8 +1,12 @@
 /** Two model-facing capabilities; the trusted tool context supplies agent identity. */
 import { defineToolPlugin } from "openclaw/plugin-sdk/tool-plugin";
-import { configSchema, modelContextSchema, staticParameters } from "./contracts.js";
+import { configSchema, importParameters, importResultSchema, modelContextSchema, staticParameters } from "./contracts.js";
+import { AttachmentRegistry } from "./attachment-registry.js";
+import { queueAttachment } from "./import-client.js";
 import { queryBroker } from "./unix-client.js";
 const CAUTION = "Retrieval relevance is not answerability. Inspect evidence text; ACCEPT never licenses invented facts. UNCERTAIN may still be useful; REJECT with empty evidence is a valid no-evidence result.";
+const registry = new AttachmentRegistry();
+const IMPORT_DESCRIPTION = "Use only after the user explicitly asks to queue this session's most recent single trusted attachment for later NAS import. QUEUED does not mean indexed.";
 function capability(config, agentId, kind) {
     if (typeof agentId !== "string" || !agentId || !config || typeof config !== "object")
         return false;
@@ -16,6 +20,19 @@ function capability(config, agentId, kind) {
     const flags = entry;
     return typeof flags.private === "boolean" && typeof flags.shared === "boolean" &&
         flags[kind] === true;
+}
+function importCapability(config, agentId, kind) {
+    if (typeof agentId !== "string" || !agentId || !config || typeof config !== "object")
+        return false;
+    const imports = config.imports;
+    if (!imports || typeof imports !== "object" || Array.isArray(imports) ||
+        !Object.hasOwn(imports, agentId))
+        return false;
+    const entry = imports[agentId];
+    if (!entry || typeof entry !== "object" || Array.isArray(entry))
+        return false;
+    const flags = entry;
+    return typeof flags.private === "boolean" && typeof flags.shared === "boolean" && flags[kind] === true;
 }
 function validateParameters(raw) {
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
@@ -54,18 +71,88 @@ export function createKnowledgeTool(kind, config, agentId) {
         },
     };
 }
-export default defineToolPlugin({
+export function createImportTool(kind, config, agentId, sessionKey, attachments = registry) {
+    if (!importCapability(config, agentId, kind) || typeof sessionKey !== "string" || !sessionKey)
+        return null;
+    const trustedAgentId = agentId;
+    const trustedSessionKey = sessionKey;
+    return {
+        name: kind === "private" ? "knowledge_import_private" : "knowledge_import_shared",
+        label: kind === "private" ? "Import Private Knowledge" : "Import Shared Knowledge",
+        description: IMPORT_DESCRIPTION,
+        parameters: importParameters,
+        outputSchema: importResultSchema,
+        async execute(_toolCallId, rawParams, signal) {
+            if (!rawParams || typeof rawParams !== "object" || Array.isArray(rawParams) ||
+                Object.keys(rawParams).length !== 0)
+                throw new Error("knowledge import parameters must be an empty object");
+            let result;
+            const selected = attachments.select(trustedAgentId, trustedSessionKey);
+            if (selected.status !== "READY") {
+                result = { status: selected.status };
+            }
+            else {
+                const opened = await attachments.openSelected(selected.attachment);
+                if (typeof opened === "string")
+                    result = { status: opened };
+                else if (!attachments.start(selected.attachment)) {
+                    await opened.handle.close();
+                    result = { status: "ALREADY_QUEUED" };
+                }
+                else {
+                    try {
+                        result = await queueAttachment(opened, trustedAgentId, kind, signal);
+                        if (result.status === "QUEUED")
+                            attachments.queued(selected.attachment);
+                        else if (result.status === "TOO_LARGE")
+                            attachments.tooLarge(selected.attachment);
+                        else
+                            throw new Error("unexpected import broker result");
+                    }
+                    catch {
+                        // After the request starts, a timeout may mean the broker accepted it.
+                        // Keep SENDING to prevent accidental duplicate queueing.
+                        result = { status: "BROKER_ERROR" };
+                    }
+                }
+            }
+            return { content: [{ type: "text", text: JSON.stringify(result) }], details: result };
+        },
+    };
+}
+const plugin = defineToolPlugin({
     id: "local-knowledge-query",
     name: "Local Knowledge Query",
-    description: "Read-only private and household-shared NAS knowledge tools via the local policy broker.",
+    description: "Private and household-shared NAS query and trusted-attachment import tools.",
     configSchema,
-    tools: (tool) => ["private", "shared"].map((kind) => tool({
-        name: kind === "private" ? "knowledge_private" : "knowledge_shared",
-        label: kind === "private" ? "Private Knowledge" : "Shared Knowledge",
-        description: `${kind === "private" ? "Query this agent's authorized private NAS knowledge." : "Query authorized household-shared NAS knowledge."} ${CAUTION}`,
-        parameters: staticParameters,
-        factory({ config, toolContext }) {
-            return createKnowledgeTool(kind, config, toolContext.agentId);
-        },
-    })),
+    tools: (tool) => [
+        ...["private", "shared"].map((kind) => tool({
+            name: kind === "private" ? "knowledge_private" : "knowledge_shared",
+            label: kind === "private" ? "Private Knowledge" : "Shared Knowledge",
+            description: `${kind === "private" ? "Query this agent's authorized private NAS knowledge." : "Query authorized household-shared NAS knowledge."} ${CAUTION}`,
+            parameters: staticParameters,
+            factory({ config, toolContext }) {
+                return createKnowledgeTool(kind, config, toolContext.agentId);
+            },
+        })),
+        ...["private", "shared"].map((kind) => tool({
+            name: kind === "private" ? "knowledge_import_private" : "knowledge_import_shared",
+            label: kind === "private" ? "Import Private Knowledge" : "Import Shared Knowledge",
+            description: IMPORT_DESCRIPTION,
+            parameters: importParameters,
+            factory({ config, toolContext }) {
+                return createImportTool(kind, config, toolContext.agentId, toolContext.sessionKey);
+            },
+        })),
+    ],
 });
+// defineToolPlugin supplies static metadata for build/validate. The public
+// Plugin API additionally registers the trusted inbound attachment hook.
+const registerTools = plugin.register;
+plugin.register = (api) => {
+    registerTools(api);
+    api.on("inbound_claim", async (event, context) => {
+        await registry.register(event, context);
+    });
+};
+export default plugin;

@@ -1,0 +1,10 @@
+{
+  "schema_version": "1.0",
+  "max_file_size_bytes": 104857600,
+  "agents": {
+    "main": {"uploader": "chen", "private": true, "shared": true},
+    "chen": {"uploader": "chen", "private": true, "shared": true},
+    "liang": {"uploader": "liang", "private": false, "shared": true},
+    "ziling": {"uploader": "azl", "private": false, "shared": true}
+  }
+}
