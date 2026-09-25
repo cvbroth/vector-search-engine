@@ -2,7 +2,7 @@
   "id": "local-knowledge-query",
   "name": "Local Knowledge Query",
   "description": "Private and household-shared NAS query and trusted-attachment import tools.",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "configSchema": {
     "type": "object",
     "required": [
