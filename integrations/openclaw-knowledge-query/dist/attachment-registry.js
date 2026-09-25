@@ -1,11 +1,13 @@
-/** In-memory, bounded registry populated only by OpenClaw's public inbound hook. */
+/** In-memory, bounded registry populated only by OpenClaw's trusted message hook. */
 import { constants } from "node:fs";
 import { lstat, open } from "node:fs/promises";
 import path from "node:path";
+import { parseAgentSessionKey } from "openclaw/plugin-sdk/routing";
 export const ATTACHMENT_TTL_MS = 30 * 60 * 1000;
 export const MAX_SESSIONS = 100;
 export const MAX_ATTACHMENTS_PER_SESSION = 8;
 export const MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024;
+export const REGISTRATION_WAIT_MS = 2_000;
 const SUFFIXES = new Set([".pdf", ".docx", ".md", ".txt"]);
 function identity(stat) {
     return { dev: stat.dev, ino: stat.ino, size: stat.size, mtimeNs: stat.mtimeNs };
@@ -15,9 +17,12 @@ function sameIdentity(a, b) {
 }
 export class AttachmentRegistry {
     now;
+    statPath;
     sessions = new Map();
-    constructor(now = Date.now) {
+    registrations = new Map();
+    constructor(now = Date.now, statPath = (file) => lstat(file, { bigint: true })) {
         this.now = now;
+        this.statPath = statPath;
     }
     key(agentId, sessionKey) {
         return `${agentId}\0${sessionKey}`;
@@ -34,17 +39,73 @@ export class AttachmentRegistry {
             this.sessions.delete(oldest);
         }
     }
-    /** Never consume originalMedia, URLs, text-supplied paths, or unstaged media. */
-    async register(event, ctx) {
+    /** The host resolves the agent-scoped session; message_received has no agentId field. */
+    registerMessageReceived(event, ctx) {
+        const sessionKey = ctx.sessionKey;
+        const parsed = parseAgentSessionKey(sessionKey);
+        if (!sessionKey || !parsed || (event.sessionKey && event.sessionKey !== sessionKey) ||
+            (event.messageId && ctx.messageId && event.messageId !== ctx.messageId))
+            return Promise.resolve();
+        // Only canonical media is consumed. OpenClaw 2026.9.4 projects QQBot's
+        // legacy MediaPaths into event.media before this observation hook fires.
+        return this.register({ media: event.media, mediaStagingPending: event.mediaStagingPending,
+            messageId: event.messageId ?? ctx.messageId, sessionKey }, { agentId: parsed.agentId, sessionKey });
+    }
+    /** Announce registration synchronously so a same-turn tool can await it. */
+    register(event, ctx) {
         const agentId = ctx.agentId;
         const sessionKey = ctx.sessionKey;
-        if (!agentId || !sessionKey || (event.sessionKey && event.sessionKey !== sessionKey))
-            return;
-        this.prune();
+        if (!agentId || !sessionKey || (event.sessionKey && event.sessionKey !== sessionKey) ||
+            (event.messageId && ctx.messageId && event.messageId !== ctx.messageId))
+            return Promise.resolve();
         const key = this.key(agentId, sessionKey);
+        const previous = this.registrations.get(key) ?? Promise.resolve();
+        const registration = previous.catch(() => { }).then(() => this.registerOne(event, key));
+        this.registrations.set(key, registration);
+        const clear = () => { if (this.registrations.get(key) === registration)
+            this.registrations.delete(key); };
+        void registration.then(clear, clear);
+        return registration;
+    }
+    /** Wait only for this agent/session, and fail closed if registration stalls. */
+    async waitForRegistration(agentId, sessionKey) {
+        const key = this.key(agentId, sessionKey);
+        const deadline = Date.now() + REGISTRATION_WAIT_MS;
+        while (true) {
+            const pending = this.registrations.get(key);
+            if (!pending)
+                return true;
+            const remaining = deadline - Date.now();
+            if (remaining <= 0)
+                return false;
+            let timer;
+            try {
+                const completed = await Promise.race([
+                    pending.then(() => true, () => false),
+                    new Promise((resolve) => { timer = setTimeout(() => resolve(false), remaining); }),
+                ]);
+                if (!completed)
+                    return false;
+            }
+            finally {
+                if (timer)
+                    clearTimeout(timer);
+            }
+            // A newer delivery for the same session may have arrived while awaiting.
+            if (this.registrations.get(key) === pending)
+                return true;
+        }
+    }
+    /** Never consume originalMedia, URLs, text-supplied paths, or unstaged media. */
+    async registerOne(event, key) {
+        this.prune();
         const previous = this.sessions.get(key);
         const media = event.media ?? [];
         if (media.length === 0 && event.mediaStagingPending !== true)
+            return;
+        const samePendingMessage = previous?.pending && previous.messageId === event.messageId &&
+            event.mediaStagingPending !== true && media.length > 0;
+        if (event.messageId && previous?.seenMessageIds.includes(event.messageId) && !samePendingMessage)
             return;
         // A repeated hook delivery must not turn a queued attachment back into READY.
         if (previous && event.messageId && previous.attachments.some((item) => item.messageId === event.messageId && item.state !== "READY"))
@@ -61,7 +122,7 @@ export class AttachmentRegistry {
                 if (!fact.path || !path.isAbsolute(fact.path))
                     continue;
                 try {
-                    const info = await lstat(fact.path, { bigint: true });
+                    const info = await this.statPath(fact.path);
                     if (!info.isFile() || info.isSymbolicLink())
                         continue;
                     const currentIdentity = identity(info);
@@ -76,7 +137,11 @@ export class AttachmentRegistry {
             }
         }
         this.sessions.delete(key);
-        this.sessions.set(key, { receivedAt, pending, overflow, attachments });
+        const seenMessageIds = previous?.seenMessageIds ?? [];
+        this.sessions.set(key, { receivedAt, messageId: event.messageId,
+            seenMessageIds: event.messageId && !seenMessageIds.includes(event.messageId)
+                ? [...seenMessageIds, event.messageId].slice(-MAX_ATTACHMENTS_PER_SESSION) : seenMessageIds,
+            pending, overflow, attachments });
         this.prune();
     }
     select(agentId, sessionKey) {

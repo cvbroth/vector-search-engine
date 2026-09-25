@@ -88,7 +88,8 @@ export function createImportTool(
       if (!rawParams || typeof rawParams !== "object" || Array.isArray(rawParams) ||
           Object.keys(rawParams).length !== 0) throw new Error("knowledge import parameters must be an empty object");
       let result: ImportOutcome;
-      const selected = attachments.select(trustedAgentId, trustedSessionKey);
+      const ready = await attachments.waitForRegistration(trustedAgentId, trustedSessionKey);
+      const selected = ready ? attachments.select(trustedAgentId, trustedSessionKey) : { status: "NO_ATTACHMENT" as const };
       if (selected.status !== "READY") {
         result = { status: selected.status };
       } else {
@@ -143,12 +144,12 @@ const plugin = defineToolPlugin({
 });
 
 // defineToolPlugin supplies static metadata for build/validate. The public
-// Plugin API additionally registers the trusted inbound attachment hook.
+// Plugin API additionally observes ordinary inbound messages before agent dispatch.
 const registerTools = plugin.register;
 plugin.register = (api) => {
   registerTools(api);
-  api.on("inbound_claim", async (event, context) => {
-    await registry.register(event, context);
+  api.on("message_received", async (event, context) => {
+    await registry.registerMessageReceived(event, context);
   });
 };
 

@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { mkdtemp, readFile, rm, symlink, truncate, utimes, writeFile } from "node:fs/promises";
+import { lstat, mkdtemp, rm, symlink, truncate, utimes, writeFile } from "node:fs/promises";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { deriveInboundMessageHookContext, toPluginMessageContext,
+  toPluginMessageReceivedEvent } from "openclaw/plugin-sdk/hook-runtime";
+import { finalizeInboundContext } from "openclaw/plugin-sdk/reply-runtime";
 import plugin, { createImportTool } from "../dist/index.js";
 import { AttachmentRegistry } from "../dist/attachment-registry.js";
 
@@ -79,23 +82,146 @@ test("model-facing import schema is strictly empty", () => {
   }
 });
 
-test("public inbound_claim hook registers only staged media path", async (t) => {
+test("message_received canonical media reaches chen private import and remains single-use", async (t) => {
   const dir = await workspace(t);
   const file = path.join(dir, "note.txt");
   await writeFile(file, "content");
+  const seen = [];
+  await fakeBroker(t, async (request, response) => {
+    for await (const _part of request) { /* Consume the attachment. */ }
+    seen.push({ path: request.url, agent: request.headers["x-knowledge-agent"] });
+    response.writeHead(200, { "Content-Type": "application/json" });
+    response.end(JSON.stringify({ status: "QUEUED", filename: "note.txt", content_type: "text/plain",
+      size_bytes: 7, sha256_prefix: "abcdef123456", access_kind: "private" }));
+  });
   const hooks = new Map();
   plugin.register({ pluginConfig: fullConfig, registerTool() {}, on(name, handler) { hooks.set(name, handler); } });
-  assert.ok(hooks.has("inbound_claim"));
-  const sessionKey = randomUUID();
-  await hooks.get("inbound_claim")({ messageId: "m1", mediaStagingPending: true,
-    originalMedia: [{ path: file }] }, { agentId: "main", sessionKey });
-  const tool = createImportTool("shared", fullConfig, "main", sessionKey);
+  assert.ok(hooks.has("message_received"));
+  assert.equal(hooks.has("inbound_claim"), false);
+  const sessionKey = `agent:chen:qqbot:direct:${randomUUID()}`;
+  const tool = createImportTool("private", fullConfig, "chen", sessionKey);
+  await hooks.get("message_received")({ from: "qqbot:user", content: "导入附件", messageId: "m1",
+    sessionKey, mediaStagingPending: true, originalMedia: [{ path: file }] },
+  { channelId: "qqbot", sessionKey, messageId: "m1" });
   assert.equal(details(await tool.execute("1", {})).status, "NO_ATTACHMENT");
-  await hooks.get("inbound_claim")({ messageId: "m2", media: [{ path: file, contentType: "text/plain" }] },
-    { agentId: "main", sessionKey });
+  const event = { from: "qqbot:user", content: "导入附件", messageId: "m1", sessionKey,
+    media: [{ path: file, contentType: "text/plain" }] };
+  const context = { channelId: "qqbot", sessionKey, messageId: "m1" };
+  await hooks.get("message_received")(event, context);
   assert.equal(tool.parameters.additionalProperties, false);
   assert.equal(tool.outputSchema.additionalProperties, false);
   await assert.rejects(tool.execute("1", { path: file }), /empty object/);
+  assert.equal(details(await tool.execute("2", {})).status, "QUEUED");
+  await hooks.get("message_received")(event, context);
+  assert.equal(details(await tool.execute("3", {})).status, "ALREADY_QUEUED");
+  assert.deepEqual(seen, [{ path: "/v1/private-attachment", agent: "chen" }]);
+  assert.equal(createImportTool("private", fullConfig, "liang", sessionKey), null);
+  assert.equal(createImportTool("private", fullConfig, "ziling", sessionKey), null);
+});
+
+test("QQBot 2.0.3 legacy document fields become canonical OpenClaw media", async (t) => {
+  const dir = await workspace(t);
+  for (const [extension, contentType] of [
+    ["txt", "text/plain"], ["pdf", "application/pdf"],
+    ["docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"],
+    ["md", "text/markdown"],
+  ]) {
+    const file = path.join(dir, `document.${extension}`);
+    await writeFile(file, "content");
+    const sessionKey = `agent:chen:qqbot:direct:${extension}`;
+    const finalized = finalizeInboundContext({ Body: "导入附件", Provider: "qqbot", SessionKey: sessionKey,
+      MessageSid: `message-${extension}`, MediaPaths: [file], MediaTypes: [contentType] });
+    const canonical = deriveInboundMessageHookContext(finalized);
+    const event = toPluginMessageReceivedEvent(canonical);
+    const registry = new AttachmentRegistry();
+    assert.equal(event.media?.[0]?.path, file);
+    await registry.registerMessageReceived(event, toPluginMessageContext(canonical));
+    const selected = registry.select("chen", sessionKey);
+    assert.equal(selected.status, "READY", extension);
+    const opened = await registry.openSelected(selected.attachment);
+    assert.equal(typeof opened, "object", extension);
+    await opened.handle.close();
+  }
+});
+
+test("canonical media wins over legacy metadata and text-supplied paths are ignored", async (t) => {
+  const dir = await workspace(t);
+  const canonicalPath = path.join(dir, "canonical.txt");
+  const legacyPath = path.join(dir, "legacy.txt");
+  await writeFile(canonicalPath, "canonical");
+  await writeFile(legacyPath, "legacy");
+  const sessionKey = `agent:chen:qqbot:direct:${randomUUID()}`;
+  const finalized = finalizeInboundContext({ Body: "导入", Provider: "qqbot", SessionKey: sessionKey,
+    MessageSid: "m1", media: [{ path: canonicalPath, contentType: "text/plain" }],
+    MediaPaths: [legacyPath], MediaTypes: ["text/plain"] });
+  const canonical = deriveInboundMessageHookContext(finalized);
+  const registry = new AttachmentRegistry();
+  await registry.registerMessageReceived(toPluginMessageReceivedEvent(canonical), toPluginMessageContext(canonical));
+  assert.equal(registry.select("chen", sessionKey).attachment.trustedPath, canonicalPath);
+
+  const forged = new AttachmentRegistry();
+  await forged.registerMessageReceived({ from: "qqbot:user",
+    content: "/etc/passwd /home/xxx/file https://example.com/file.txt", sessionKey, messageId: "m2",
+    metadata: { mediaPaths: [legacyPath], mediaPath: legacyPath } },
+  { channelId: "qqbot", sessionKey, messageId: "m2" });
+  assert.equal(forged.select("chen", sessionKey).status, "NO_ATTACHMENT");
+  await forged.registerMessageReceived({ from: "qqbot:user", content: "导入", sessionKey,
+    messageId: "m3", media: [{ url: "https://example.com/file.txt" }] },
+  { channelId: "qqbot", sessionKey, messageId: "m3" });
+  assert.equal(forged.select("chen", sessionKey).status, "NO_ATTACHMENT");
+});
+
+test("mismatched session/message identity and late duplicate delivery cannot replace current media", async (t) => {
+  const dir = await workspace(t);
+  const first = path.join(dir, "first.txt");
+  const second = path.join(dir, "second.txt");
+  await writeFile(first, "first");
+  await writeFile(second, "second");
+  const sessionKey = `agent:chen:qqbot:direct:${randomUUID()}`;
+  const registry = new AttachmentRegistry();
+  const event = (messageId, file) => ({ from: "qqbot:user", content: "导入", sessionKey,
+    messageId, media: [{ path: file }] });
+  await registry.registerMessageReceived(event("m1", first),
+    { channelId: "qqbot", sessionKey: `${sessionKey}:wrong`, messageId: "m1" });
+  await registry.registerMessageReceived(event("m1", first),
+    { channelId: "qqbot", sessionKey, messageId: "m2" });
+  assert.equal(registry.select("chen", sessionKey).status, "NO_ATTACHMENT");
+  await registry.registerMessageReceived(event("m1", first), { channelId: "qqbot", sessionKey, messageId: "m1" });
+  await registry.registerMessageReceived(event("m2", second), { channelId: "qqbot", sessionKey, messageId: "m2" });
+  await registry.registerMessageReceived(event("m1", first), { channelId: "qqbot", sessionKey, messageId: "m1" });
+  assert.equal(registry.select("chen", sessionKey).attachment.trustedPath, second);
+});
+
+test("message_received registration is a same-session barrier, not a cross-session wait", async (t) => {
+  const dir = await workspace(t);
+  const file = path.join(dir, "race.txt");
+  await writeFile(file, "content");
+  await fakeBroker(t, async (request, response) => {
+    for await (const _part of request) { /* Consume the attachment. */ }
+    response.writeHead(200, { "Content-Type": "application/json" });
+    response.end(JSON.stringify({ status: "QUEUED", filename: "race.txt", content_type: "text/plain",
+      size_bytes: 7, sha256_prefix: "abcdef123456", access_kind: "private" }));
+  });
+  let release;
+  const blocked = new Promise((resolve) => { release = resolve; });
+  const registry = new AttachmentRegistry(Date.now, async (filePath) => {
+    await blocked;
+    return lstat(filePath, { bigint: true });
+  });
+  const sessionKey = `agent:chen:qqbot:direct:${randomUUID()}`;
+  const registration = registry.registerMessageReceived({ from: "qqbot:user", content: "导入", messageId: "m1",
+    sessionKey, media: [{ path: file, contentType: "text/plain" }] },
+  { channelId: "qqbot", sessionKey, messageId: "m1" });
+  const tool = createImportTool("private", fullConfig, "chen", sessionKey, registry);
+  let completed = false;
+  const call = tool.execute("1", {}).then((result) => { completed = true; return result; });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(completed, false);
+  const other = createImportTool("private", fullConfig, "chen", `${sessionKey}:other`, registry);
+  assert.equal(details(await other.execute("2", {})).status, "NO_ATTACHMENT");
+  release();
+  await registration;
+  assert.equal(details(await call).status, "QUEUED");
 });
 
 test("no attachment, pending staging, and multiple media fail closed", async (t) => {
@@ -125,7 +251,7 @@ test("registry isolates agent and session and ignores missing trusted identity",
   assert.equal(registry.select("main", "other").status, "NO_ATTACHMENT");
 });
 
-test("symlink and nonregular staged paths never become READY", async (t) => {
+test("symlink staged paths never become READY", async (t) => {
   const dir = await workspace(t);
   const target = path.join(dir, "target.txt");
   const link = path.join(dir, "link.txt");
@@ -134,6 +260,11 @@ test("symlink and nonregular staged paths never become READY", async (t) => {
   const registry = new AttachmentRegistry();
   await register(registry, link);
   assert.equal(registry.select("main", "s").status, "NO_ATTACHMENT");
+});
+
+test("nonregular staged paths never become READY", async (t) => {
+  const dir = await workspace(t);
+  const registry = new AttachmentRegistry();
   await register(registry, dir, { messageId: "dir" });
   assert.equal(registry.select("main", "s").status, "NO_ATTACHMENT");
 });

@@ -28,11 +28,13 @@ pnpm run plugin:validate
 
 打包时保留 `dist/`、`package.json` 和 `openclaw.plugin.json`。本地测试与 manifest 验证不等于已在用户的 OpenClaw 容器部署或验证。
 
-## 可信附件导入（按需，尚未部署）
+## 可信附件导入（按需）
 
-OpenClaw 2026.9.4 的公开 `inbound_claim` Hook 类型提供 `event.media`（已暂存的本地附件路径）及 `event.mediaStagingPending`，Hook context 有可选 `agentId` / `sessionKey`。插件仅接受该 Hook 的 `media.path`；不用 `originalMedia`、URL、聊天文字中的路径或私有 bundle。公开媒体事实没有独立的原始文件名字段，目前以暂存路径 basename 作为文件名；若渠道暂存名不保留 `.pdf/.docx/.md/.txt` 扩展名，则拒绝而不是让模型覆写。缺少 Agent/会话键、暂存未完成时不登记 READY。Registry 是进程内状态：30 分钟 TTL，最多 100 个会话和每会话 8 个附件；Gateway 重启即失效。一次只自动选择最近一条**单附件**消息；多附件返回 `SELECTION_REQUIRED`，无附件返回 `NO_ATTACHMENT`。不会在聊天中主动建议入库。
+插件通过 OpenClaw 2026.9.4 的 `message_received` 观察 Hook 捕获普通入站消息，不再依赖仅面向已绑定会话的 `inbound_claim`。只接受同一可信 OpenClaw 会话中的 canonical `event.media.path`，并核对 sessionKey / messageId；Agent 身份来自可信会话键与工具运行上下文，不取自模型参数。QQBot 2.0.3 的普通文档虽以 legacy `MediaPaths` / `MediaTypes` 提交，但 OpenClaw 2026.9.4 的入站定稿流程会将其投影为 canonical `event.media`；插件不直接解析 legacy metadata。canonical media 缺失时不会从消息文本、`originalMedia`、任意宿主路径或 URL 补取。公开媒体事实没有独立的原始文件名字段，目前以暂存路径 basename 作为文件名；若渠道暂存名不保留 `.pdf/.docx/.md/.txt` 扩展名，则拒绝而不是让模型覆写。
 
-导入前重新核对暂存文件的 dev/inode/size/mtime，以 `O_NOFOLLOW` 打开并 `fstat` 已打开文件；仅允许 `.pdf`、`.docx`、`.md`、`.txt`，上限 100 MiB。正文以 raw HTTP body 流式发送到固定 `/run/knowledge-import-broker/import.sock`，不在 JSON 中 base64 编码。Broker 根据固定宿主机 policy 映射 `agentId` 到 NAS uploader，并只把附件排入其私人 Inbox；`QUEUED` **不代表已索引**。传输错误或响应不确定时返回 `BROKER_ERROR`，同一附件不会自动重发，需人工核对 Inbox。真实渠道是否提供可用 Hook 媒体路径、普通 rename/fsync 和所有目录权限，仍待服务器实测。
+`message_received` 在宿主机中以 fire-and-forget 方式触发，插件会同步登记每个 Agent/会话的 pending registration；同一轮工具调用仅在本会话内有界等待最多 2 秒，避免文件尚未完成校验时误报 `NO_ATTACHMENT`。缺少可信会话键或暂存未完成时不登记 READY。Registry 是进程内状态：30 分钟 TTL，最多 100 个会话和每会话 8 个附件；Gateway 重启即失效。一次只自动选择最近一条**单附件**消息；多附件返回 `SELECTION_REQUIRED`，无附件返回 `NO_ATTACHMENT`。不会在聊天中主动建议入库。
+
+导入前重新核对暂存文件的 dev/inode/size/mtime，以 `O_NOFOLLOW` 打开并 `fstat` 已打开文件；拒绝符号链接和非普通文件，仅允许 `.pdf`、`.docx`、`.md`、`.txt`，上限 100 MiB。正文以 raw HTTP body 流式发送到固定 `/run/knowledge-import-broker/import.sock`，不在 JSON 中 base64 编码。Broker 根据固定宿主机 policy 映射 `agentId` 到 NAS uploader，并只把附件排入其私人 Inbox；`QUEUED` **只表示进入异步导入队列，不代表已索引**。传输错误或响应不确定时返回 `BROKER_ERROR`，同一附件不会自动重发，需人工核对 Inbox。本次源码及本地测试不等于已在真实 QQ 会话完成端到端验证。
 
 查询可见性仍由 `agents` 配置决定；写入工具由**独立、可选**的 `imports` 配置决定。缺少 `imports` 时两个写入工具完全不暴露，旧配置不会获得写权限。示例：
 
