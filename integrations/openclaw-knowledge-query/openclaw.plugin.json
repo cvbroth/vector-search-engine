@@ -57,6 +57,9 @@
   "activation": {
     "onStartup": true
   },
+  "skills": [
+    "./skills"
+  ],
   "contracts": {
     "tools": [
       "knowledge_private",

@@ -14,6 +14,16 @@
 
 查询插件只用 Node 内置 `http.request({socketPath})` 对 Query Broker 发请求，不调用 shell、其他命令行客户端、NAS 文件或 SQLite，也不提供 TCP/任意 URL。私人/共享分别固定调用 `POST /v1/private-context` 与 `POST /v1/shared-context`。`agent_id` 由插件从 OpenClaw 运行时上下文注入，绝不取自模型参数。导入工具只访问 OpenClaw 已暂存的可信附件，以及固定的 Import Broker Unix socket；不访问 NAS Inbox 或 Source。
 
+## Knowledge Ingestion Skill
+
+插件附带 `skills/knowledge-ingestion/SKILL.md`：指导 Agent 在完成当前附件任务后，判断是否值得长期保存、征求私人或家庭共享范围的明确选择，并准确解释导入队列状态。它只负责知识沉淀的决策与交互，不负责存储、索引，也不赋予新的工具权限；是否可调用工具仍由现有插件配置和 Broker 授权决定。OpenClaw 2026.9.4 会在启用插件且 Skill 符合 Agent 可见性配置时发现它；源码提交本身不等于已在真实 Gateway 加载。
+
+```text
+Knowledge Ingestion Skill → knowledge_import_private/shared → Local Knowledge Query plugin
+                          → Knowledge Import Broker → Importer / Indexer
+Agent → knowledge_private/shared → Knowledge Broker → vector / lexical retrieval
+```
+
 ## 构建和验证
 
 目标版本：OpenClaw 2026.9.4，Node.js 24.16+。在本目录执行：
@@ -32,7 +42,7 @@ pnpm run plugin:validate
 
 插件通过 OpenClaw 2026.9.4 的 `message_received` 观察 Hook 捕获普通入站消息，不再依赖仅面向已绑定会话的 `inbound_claim`。只接受同一可信 OpenClaw 会话中的 canonical `event.media.path`，并核对 sessionKey / messageId；Agent 身份来自可信会话键与工具运行上下文，不取自模型参数。QQBot 2.0.3 的普通文档虽以 legacy `MediaPaths` / `MediaTypes` 提交，但 OpenClaw 2026.9.4 的入站定稿流程会将其投影为 canonical `event.media`；插件不直接解析 legacy metadata。canonical media 缺失时不会从消息文本、`originalMedia`、任意宿主路径或 URL 补取。公开媒体事实没有独立的原始文件名字段，目前以暂存路径 basename 作为文件名；若渠道暂存名不保留 `.pdf/.docx/.md/.txt` 扩展名，则拒绝而不是让模型覆写。
 
-`message_received` 在宿主机中以 fire-and-forget 方式触发，插件会同步登记每个 Agent/会话的 pending registration；同一轮工具调用仅在本会话内有界等待最多 2 秒，避免文件尚未完成校验时误报 `NO_ATTACHMENT`。缺少可信会话键或暂存未完成时不登记 READY。Registry 是进程内状态：30 分钟 TTL，最多 100 个会话和每会话 8 个附件；Gateway 重启即失效。一次只自动选择最近一条**单附件**消息；多附件返回 `SELECTION_REQUIRED`，无附件返回 `NO_ATTACHMENT`。不会在聊天中主动建议入库。
+`message_received` 在宿主机中以 fire-and-forget 方式触发，插件会同步登记每个 Agent/会话的 pending registration；同一轮工具调用仅在本会话内有界等待最多 2 秒，避免文件尚未完成校验时误报 `NO_ATTACHMENT`。缺少可信会话键或暂存未完成时不登记 READY。Registry 是进程内状态：30 分钟 TTL，最多 100 个会话和每会话 8 个附件；Gateway 重启即失效。一次只自动选择最近一条**单附件**消息；多附件返回 `SELECTION_REQUIRED`，无附件返回 `NO_ATTACHMENT`。插件本身不会主动建议入库；这类交互由上面的 Skill 指导 Agent 决定。
 
 导入前重新核对暂存文件的 dev/inode/size/mtime，以 `O_NOFOLLOW` 打开并 `fstat` 已打开文件；拒绝符号链接和非普通文件，仅允许 `.pdf`、`.docx`、`.md`、`.txt`，上限 100 MiB。正文以 raw HTTP body 流式发送到固定 `/run/knowledge-import-broker/import.sock`，不在 JSON 中 base64 编码。Broker 根据固定宿主机 policy 映射 `agentId` 到 NAS uploader，并只把附件排入其私人 Inbox；`QUEUED` **只表示进入异步导入队列，不代表已索引**。传输错误或响应不确定时返回 `BROKER_ERROR`，同一附件不会自动重发，需人工核对 Inbox。本次源码及本地测试不等于已在真实 QQ 会话完成端到端验证。
 
