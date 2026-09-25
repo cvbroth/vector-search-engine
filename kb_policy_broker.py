@@ -199,7 +199,7 @@ def validate_backend_context(value: Any, query: str, scope: str, top_k: int) -> 
         if (
             item["scope"] != scope or type(item["rank"]) is not int or item["rank"] != rank
             or not _is_number(item["fused_score"])
-            or any(field is not None and not _is_number(item[field]) for field in
+            or any(item[field] is not None and not _is_number(item[field]) for field in
                    ("semantic_score", "semantic_distance", "lexical_score"))
             or type(item["lexical_match"]) is not bool
             or not isinstance(item["relevance_decision"], str)

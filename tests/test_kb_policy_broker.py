@@ -221,6 +221,42 @@ class BrokerTests(unittest.TestCase):
             with self.assertRaises(broker.BackendError):
                 broker.to_model_context(invalid, "q", "chen", 5)
 
+    def test_backend_nullable_scores_and_retrieval_status(self) -> None:
+        for field in ("lexical_score", "semantic_score", "semantic_distance"):
+            with self.subTest(field=field, value=None):
+                valid = context("UNCERTAIN", "q", "family")
+                valid["evidence"][0][field] = None
+                if field == "lexical_score":
+                    valid["evidence"][0]["lexical_match"] = False
+                self.assertEqual(broker.validate_backend_context(valid, "q", "family", 5), valid)
+                self.assertIsNone(broker.to_model_context(valid, "q", "family", 5)["evidence"][0][field])
+
+            with self.subTest(field=field, value="float"):
+                valid = context("UNCERTAIN", "q", "family")
+                valid["evidence"][0][field] = 0.5
+                self.assertEqual(broker.validate_backend_context(valid, "q", "family", 5), valid)
+
+            for invalid_value in ("0.5", {}, True, float("inf")):
+                with self.subTest(field=field, value=invalid_value):
+                    invalid = context("UNCERTAIN", "q", "family")
+                    invalid["evidence"][0][field] = invalid_value
+                    with self.assertRaises(broker.BackendError):
+                        broker.validate_backend_context(invalid, "q", "family", 5)
+
+        mixed = context("ACCEPT", "q", "family")
+        uncertain = {**mixed["evidence"][0], "rank": 2, "relevance_decision": "UNCERTAIN",
+                     "lexical_match": False, "lexical_score": None}
+        mixed["evidence"].append(uncertain)
+        mixed["evidence_count"] = 2
+        self.assertEqual(broker.validate_backend_context(mixed, "q", "family", 5), mixed)
+
+        all_uncertain = context("UNCERTAIN", "q", "family")
+        all_uncertain["evidence"][0].update(lexical_match=False, lexical_score=None)
+        self.assertEqual(broker.validate_backend_context(all_uncertain, "q", "family", 5), all_uncertain)
+
+        rejected = context("REJECT", "q", "family")
+        self.assertEqual(broker.validate_backend_context(rejected, "q", "family", 5), rejected)
+
     def test_backend_transport_status_malformed_oversized_timeout(self) -> None:
         class FakeResponse:
             def __init__(self, status: int, body: bytes) -> None:
