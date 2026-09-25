@@ -56,6 +56,7 @@ class ImportBrokerTests(unittest.TestCase):
             "schema_version": "1.0", "max_file_size_bytes": 1024,
             "agents": {"ziling": {"uploader": "azl", "private": False, "shared": True}},
         }), encoding="utf-8")
+        policy_file.chmod(0o600)
         loaded = broker.load_policy(policy_file)
         self.assertEqual(loaded.resolve("ziling", "shared"), "azl")
         policy_file.write_text('{"schema_version":"1.0","schema_version":"1.0"}', encoding="utf-8")
