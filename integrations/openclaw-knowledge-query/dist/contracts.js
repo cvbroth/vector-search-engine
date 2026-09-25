@@ -47,7 +47,7 @@ export const importResultSchema = Type.Object({
         Type.Literal("QUEUED"), Type.Literal("NO_ATTACHMENT"),
         Type.Literal("SELECTION_REQUIRED"), Type.Literal("UNSUPPORTED_TYPE"),
         Type.Literal("ATTACHMENT_CHANGED"), Type.Literal("TOO_LARGE"),
-        Type.Literal("ALREADY_QUEUED"), Type.Literal("BROKER_ERROR"),
+        Type.Literal("ALREADY_QUEUED"), Type.Literal("CONSENT_REQUIRED"), Type.Literal("BROKER_ERROR"),
     ]),
     filename: Type.Optional(Type.String()),
     content_type: Type.Optional(Type.String()),

@@ -40,6 +40,8 @@ pnpm run plugin:validate
 
 ## 可信附件导入（按需）
 
+从 0.2.3 起，导入插件还会在写入前检查可信 `message_received` 用户消息中的明确导入指令。授权绑定当前 Agent、会话、唯一可信附件和 private/shared 目标，5 分钟内有效且开始一次导入后即消费。普通上传/讨论或“可以”“存起来”等含糊表达不会授权；此时工具返回 `CONSENT_REQUIRED`，不会连接 Import Broker，也不会把附件变为 SENDING。Agent 应请用户用完整指令明确目标，不得立即重试或改用另一导入工具。模型工具参数不能提供授权；该规则是保守的确定性匹配，不尝试理解全部自然语言。
+
 插件通过 OpenClaw 2026.9.4 的 `message_received` 观察 Hook 捕获普通入站消息，不再依赖仅面向已绑定会话的 `inbound_claim`。只接受同一可信 OpenClaw 会话中的 canonical `event.media.path`，并核对 sessionKey / messageId；Agent 身份来自可信会话键与工具运行上下文，不取自模型参数。QQBot 2.0.3 的普通文档虽以 legacy `MediaPaths` / `MediaTypes` 提交，但 OpenClaw 2026.9.4 的入站定稿流程会将其投影为 canonical `event.media`；插件不直接解析 legacy metadata。canonical media 缺失时不会从消息文本、`originalMedia`、任意宿主路径或 URL 补取。公开媒体事实没有独立的原始文件名字段，目前以暂存路径 basename 作为文件名；若渠道暂存名不保留 `.pdf/.docx/.md/.txt` 扩展名，则拒绝而不是让模型覆写。
 
 `message_received` 在宿主机中以 fire-and-forget 方式触发，插件会同步登记每个 Agent/会话的 pending registration；同一轮工具调用仅在本会话内有界等待最多 2 秒，避免文件尚未完成校验时误报 `NO_ATTACHMENT`。缺少可信会话键或暂存未完成时不登记 READY。Registry 是进程内状态：30 分钟 TTL，最多 100 个会话和每会话 8 个附件；Gateway 重启即失效。一次只自动选择最近一条**单附件**消息；多附件返回 `SELECTION_REQUIRED`，无附件返回 `NO_ATTACHMENT`。插件本身不会主动建议入库；这类交互由上面的 Skill 指导 Agent 决定。

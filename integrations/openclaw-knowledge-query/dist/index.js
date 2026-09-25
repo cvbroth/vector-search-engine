@@ -6,7 +6,7 @@ import { queueAttachment } from "./import-client.js";
 import { queryBroker } from "./unix-client.js";
 const CAUTION = "Retrieval relevance is not answerability. Inspect evidence text; ACCEPT never licenses invented facts. UNCERTAIN may still be useful; REJECT with empty evidence is a valid no-evidence result.";
 const registry = new AttachmentRegistry();
-const IMPORT_DESCRIPTION = "Use only after the user explicitly asks to queue this session's most recent single trusted attachment for later NAS import. QUEUED does not mean indexed.";
+const IMPORT_DESCRIPTION = "Use only after the user explicitly asks to queue this session's most recent single trusted attachment for this destination. Without matching user consent the tool returns CONSENT_REQUIRED. QUEUED does not mean indexed.";
 function capability(config, agentId, kind) {
     if (typeof agentId !== "string" || !agentId || !config || typeof config !== "object")
         return false;
@@ -92,28 +92,34 @@ export function createImportTool(kind, config, agentId, sessionKey, attachments 
             if (selected.status !== "READY") {
                 result = { status: selected.status };
             }
+            else if (!attachments.hasConsent(trustedAgentId, trustedSessionKey, kind, selected.attachment)) {
+                result = { status: "CONSENT_REQUIRED" };
+            }
             else {
                 const opened = await attachments.openSelected(selected.attachment);
                 if (typeof opened === "string")
                     result = { status: opened };
-                else if (!attachments.start(selected.attachment)) {
-                    await opened.handle.close();
-                    result = { status: "ALREADY_QUEUED" };
-                }
                 else {
-                    try {
-                        result = await queueAttachment(opened, trustedAgentId, kind, signal);
-                        if (result.status === "QUEUED")
-                            attachments.queued(selected.attachment);
-                        else if (result.status === "TOO_LARGE")
-                            attachments.tooLarge(selected.attachment);
-                        else
-                            throw new Error("unexpected import broker result");
+                    const started = attachments.startIfConsented(trustedAgentId, trustedSessionKey, kind, selected.attachment);
+                    if (started !== "STARTED") {
+                        await opened.handle.close();
+                        result = { status: started };
                     }
-                    catch {
-                        // After the request starts, a timeout may mean the broker accepted it.
-                        // Keep SENDING to prevent accidental duplicate queueing.
-                        result = { status: "BROKER_ERROR" };
+                    else {
+                        try {
+                            result = await queueAttachment(opened, trustedAgentId, kind, signal);
+                            if (result.status === "QUEUED")
+                                attachments.queued(selected.attachment);
+                            else if (result.status === "TOO_LARGE")
+                                attachments.tooLarge(selected.attachment);
+                            else
+                                throw new Error("unexpected import broker result");
+                        }
+                        catch {
+                            // After the request starts, a timeout may mean the broker accepted it.
+                            // Keep SENDING to prevent accidental duplicate queueing.
+                            result = { status: "BROKER_ERROR" };
+                        }
                     }
                 }
             }

@@ -3,9 +3,12 @@ import { constants } from "node:fs";
 import { lstat, open } from "node:fs/promises";
 import path from "node:path";
 import { parseAgentSessionKey } from "openclaw/plugin-sdk/routing";
+import { parseExplicitImportConsent } from "./import-consent.js";
 export const ATTACHMENT_TTL_MS = 30 * 60 * 1000;
+export const CONSENT_TTL_MS = 5 * 60 * 1000;
 export const MAX_SESSIONS = 100;
 export const MAX_ATTACHMENTS_PER_SESSION = 8;
+export const MAX_MESSAGE_IDS_PER_SESSION = 128;
 export const MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024;
 export const REGISTRATION_WAIT_MS = 2_000;
 const SUFFIXES = new Set([".pdf", ".docx", ".md", ".txt"]);
@@ -48,7 +51,8 @@ export class AttachmentRegistry {
             return Promise.resolve();
         // Only canonical media is consumed. OpenClaw 2026.9.4 projects QQBot's
         // legacy MediaPaths into event.media before this observation hook fires.
-        return this.register({ media: event.media, mediaStagingPending: event.mediaStagingPending,
+        // Only a trusted inbound user hook can grant consent; model tool arguments cannot.
+        return this.register({ content: event.content, media: event.media, mediaStagingPending: event.mediaStagingPending,
             messageId: event.messageId ?? ctx.messageId, sessionKey }, { agentId: parsed.agentId, sessionKey });
     }
     /** Announce registration synchronously so a same-turn tool can await it. */
@@ -101,12 +105,18 @@ export class AttachmentRegistry {
         this.prune();
         const previous = this.sessions.get(key);
         const media = event.media ?? [];
-        if (media.length === 0 && event.mediaStagingPending !== true)
+        if (!previous && media.length === 0 && event.mediaStagingPending !== true)
             return;
         const samePendingMessage = previous?.pending && previous.messageId === event.messageId &&
             event.mediaStagingPending !== true && media.length > 0;
         if (event.messageId && previous?.seenMessageIds.includes(event.messageId) && !samePendingMessage)
             return;
+        // Never evict an old authorization message ID and accidentally accept its replay.
+        if (previous && previous.seenMessageIds.length >= MAX_MESSAGE_IDS_PER_SESSION &&
+            !samePendingMessage) {
+            previous.consent = undefined;
+            return;
+        }
         // A repeated hook delivery must not turn a queued attachment back into READY.
         if (previous && event.messageId && previous.attachments.some((item) => item.messageId === event.messageId && item.state !== "READY"))
             return;
@@ -114,6 +124,23 @@ export class AttachmentRegistry {
             media.some((fact) => fact.path === item.trustedPath)))
             return;
         const receivedAt = this.now();
+        const seenMessageIds = previous?.seenMessageIds ?? [];
+        const nextSeenMessageIds = event.messageId && !seenMessageIds.includes(event.messageId)
+            ? [...seenMessageIds, event.messageId] : seenMessageIds;
+        if (media.length === 0 && event.mediaStagingPending !== true) {
+            if (!previous)
+                return;
+            // A new user turn supersedes prior consent, even when it has no media.
+            const attachment = !previous.pending && !previous.overflow && previous.attachments.length === 1
+                ? previous.attachments[0] : undefined;
+            const kind = event.messageId ? parseExplicitImportConsent(event.content) : null;
+            previous.consent = kind && attachment?.state === "READY"
+                ? { kind, attachment, expiresAt: receivedAt + CONSENT_TTL_MS } : undefined;
+            // A later user turn must prevent late staging of the older message from reviving its consent.
+            previous.messageId = event.messageId;
+            previous.seenMessageIds = nextSeenMessageIds;
+            return;
+        }
         const pending = event.mediaStagingPending === true;
         const overflow = media.length > MAX_ATTACHMENTS_PER_SESSION;
         const attachments = [];
@@ -137,11 +164,12 @@ export class AttachmentRegistry {
             }
         }
         this.sessions.delete(key);
-        const seenMessageIds = previous?.seenMessageIds ?? [];
+        const kind = event.messageId && !pending && !overflow && attachments.length === 1
+            ? parseExplicitImportConsent(event.content) : null;
         this.sessions.set(key, { receivedAt, messageId: event.messageId,
-            seenMessageIds: event.messageId && !seenMessageIds.includes(event.messageId)
-                ? [...seenMessageIds, event.messageId].slice(-MAX_ATTACHMENTS_PER_SESSION) : seenMessageIds,
-            pending, overflow, attachments });
+            seenMessageIds: nextSeenMessageIds, pending, overflow, attachments,
+            consent: kind && attachments[0].state === "READY"
+                ? { kind, attachment: attachments[0], expiresAt: receivedAt + CONSENT_TTL_MS } : undefined });
         this.prune();
     }
     select(agentId, sessionKey) {
@@ -159,6 +187,20 @@ export class AttachmentRegistry {
         if (attachment.state !== "READY")
             return { status: "ALREADY_QUEUED" };
         return { status: "READY", attachment };
+    }
+    hasConsent(agentId, sessionKey, kind, attachment) {
+        this.prune();
+        const consent = this.sessions.get(this.key(agentId, sessionKey))?.consent;
+        return consent?.kind === kind && consent.attachment === attachment && this.now() < consent.expiresAt;
+    }
+    /** Check and consume consent in the same synchronous step as READY -> SENDING. */
+    startIfConsented(agentId, sessionKey, kind, attachment) {
+        if (!this.hasConsent(agentId, sessionKey, kind, attachment))
+            return "CONSENT_REQUIRED";
+        if (!this.start(attachment))
+            return "ALREADY_QUEUED";
+        this.sessions.get(this.key(agentId, sessionKey)).consent = undefined;
+        return "STARTED";
     }
     /** Open the recorded inode, then verify the actual fd before sending bytes. */
     async openSelected(attachment) {

@@ -12,7 +12,7 @@ const MAX_RESPONSE_BYTES = 4096;
 
 export type ImportOutcome = {
   status: "QUEUED" | "NO_ATTACHMENT" | "SELECTION_REQUIRED" | "UNSUPPORTED_TYPE" |
-    "ATTACHMENT_CHANGED" | "TOO_LARGE" | "ALREADY_QUEUED" | "BROKER_ERROR";
+    "ATTACHMENT_CHANGED" | "TOO_LARGE" | "ALREADY_QUEUED" | "CONSENT_REQUIRED" | "BROKER_ERROR";
   filename?: string;
   content_type?: string;
   size_bytes?: number;
