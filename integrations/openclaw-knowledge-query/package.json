@@ -1,6 +1,6 @@
 {
   "name": "openclaw-plugin-local-knowledge-query",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "private": true,
   "type": "module",
   "engines": {
@@ -14,7 +14,7 @@
   ],
   "scripts": {
     "build": "tsc",
-    "test": "tsc && node --test tests/knowledge-query.test.mjs tests/knowledge-import.test.mjs",
+    "test": "tsc && node --test tests/knowledge-query.test.mjs tests/knowledge-import.test.mjs tests/knowledge-ingestion.test.mjs",
     "plugin:build": "tsc && openclaw plugins build --entry ./dist/index.js",
     "plugin:validate": "tsc && openclaw plugins validate --entry ./dist/index.js"
   },

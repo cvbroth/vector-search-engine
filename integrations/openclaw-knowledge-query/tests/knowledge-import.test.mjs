@@ -131,6 +131,36 @@ test("real 3D-printing discussion cannot import until trusted user explicitly au
   assert.equal(brokerCalls, 1);
 });
 
+test("attachment triage, technical discussion, and bare assent never queue without explicit consent", async (t) => {
+  const dir = await workspace(t);
+  const file = path.join(dir, "printing-guide.pdf");
+  const body = "FFF/FDM support and wall thickness guide";
+  await writeFile(file, body);
+  let brokerCalls = 0;
+  await fakeBroker(t, async (request, response) => {
+    brokerCalls++;
+    for await (const _part of request) { /* Consume trusted bytes. */ }
+    response.writeHead(200, { "Content-Type": "application/json" });
+    response.end(JSON.stringify({ status: "QUEUED", filename: "printing-guide.pdf",
+      content_type: "application/pdf", size_bytes: Buffer.byteLength(body), sha256_prefix: "abcdef123456",
+      access_kind: "private" }));
+  });
+  const registry = new AttachmentRegistry();
+  const sessionKey = `agent:chen:qqbot:direct:${randomUUID()}`;
+  const tool = createImportTool("private", fullConfig, "chen", sessionKey, registry);
+  await inbound(registry, { sessionKey, messageId: "m1", file, content: "" });
+  for (const [index, content] of ["帮我看看这个", "为什么悬垂需要支撑？", "先临时看看",
+    "可以", "可以"].entries()) {
+    assert.equal(details(await tool.execute(`before-${index}`, {})).status, "CONSENT_REQUIRED");
+    await inbound(registry, { sessionKey, messageId: `m${index + 2}`, content });
+  }
+  assert.equal(details(await tool.execute("after-assent", {})).status, "CONSENT_REQUIRED");
+  assert.equal(brokerCalls, 0);
+  await inbound(registry, { sessionKey, messageId: "m7", content: "把这份资料放私人知识库" });
+  assert.equal(details(await tool.execute("authorized", {})).status, "QUEUED");
+  assert.equal(brokerCalls, 1);
+});
+
 test("shared consent never authorizes private import, and ambiguous replies grant neither", async (t) => {
   const dir = await workspace(t);
   const file = path.join(dir, "family.pdf");

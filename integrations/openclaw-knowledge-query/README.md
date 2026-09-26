@@ -16,7 +16,9 @@
 
 ## Knowledge Ingestion Skill
 
-插件附带 `skills/knowledge-ingestion/SKILL.md`：指导 Agent 在完成当前附件任务后，判断是否值得长期保存、征求私人或家庭共享范围的明确选择，并准确解释导入队列状态。它只负责知识沉淀的决策与交互，不负责存储、索引，也不赋予新的工具权限；是否可调用工具仍由现有插件配置和 Broker 授权决定。OpenClaw 2026.9.4 会在启用插件且 Skill 符合 Agent 可见性配置时发现它；源码提交本身不等于已在真实 Gateway 加载。
+插件附带 `skills/knowledge-ingestion/SKILL.md`。从 0.2.4 起，它指导三层交互：收到附件时仅做 1–3 句初识并询问用户想如何处理；实质性讨论并完成当前任务后，才可对明显有长期价值的附件在末尾建议一次；只有用户用可信消息明确提出保存动作和私人/家庭共享目标，才调用对应导入工具。第一层不提知识库或授权，也不把上传等同于保存意图。它只指导对话，不负责存储、索引，也不赋予新权限；是否可调用工具仍由现有插件配置和 Broker 授权决定。OpenClaw 2026.9.4 会在启用插件且 Skill 符合 Agent 可见性配置时发现它；源码提交本身不等于已在真实 Gateway 加载。
+
+当前底层 consent gate **不**组合“Agent 提议私人库”与用户随后单独回复“可以”；该回复仍得到 `CONSENT_REQUIRED`。Skill 会请用户再给出完整的“保存/导入 + 目标库”指令，不会放宽 `src/import-consent.ts` 的规则。仓库中的 Skill 测试验证文档约束与确定性授权边界，不等于已经评测真实模型每一次回复。
 
 ```text
 Knowledge Ingestion Skill → knowledge_import_private/shared → Local Knowledge Query plugin
