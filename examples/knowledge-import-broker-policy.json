@@ -4,7 +4,7 @@
   "agents": {
     "main": {"uploader": "chen", "private": true, "shared": true},
     "chen": {"uploader": "chen", "private": true, "shared": true},
-    "liang": {"uploader": "liang", "private": false, "shared": true},
-    "ziling": {"uploader": "azl", "private": false, "shared": true}
+    "liang": {"uploader": "liang", "private": true, "shared": true},
+    "ziling": {"uploader": "azl", "private": true, "shared": true}
   }
 }

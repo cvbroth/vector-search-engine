@@ -22,7 +22,7 @@ from types import MappingProxyType
 from typing import Any, Mapping
 from urllib.parse import unquote
 
-from config import reject_symlink_components
+from config import PRIVATE_SCOPE_BY_AGENT, PRIVATE_SCOPE_BY_UPLOADER, reject_symlink_components
 
 POLICY_PATH = Path("/etc/knowledge-import-broker/policy.json")
 SOCKET_PATH = Path("/run/knowledge-import-broker/import.sock")
@@ -112,11 +112,16 @@ def load_policy(path: Path = POLICY_PATH) -> ImportBrokerPolicy:
     for agent_id, item in raw_agents.items():
         if not isinstance(agent_id, str) or not NAME.fullmatch(agent_id):
             raise PolicyError("invalid agent ID")
+        if agent_id not in PRIVATE_SCOPE_BY_AGENT:
+            raise PolicyError("unknown agent ID in policy")
         if not isinstance(item, dict) or set(item) != {"uploader", "private", "shared"}:
             raise PolicyError("invalid agent rule")
         uploader = item["uploader"]
         if not isinstance(uploader, str) or not NAME.fullmatch(uploader):
             raise PolicyError("invalid uploader")
+        if (uploader not in PRIVATE_SCOPE_BY_UPLOADER
+                or PRIVATE_SCOPE_BY_UPLOADER[uploader] != PRIVATE_SCOPE_BY_AGENT[agent_id]):
+            raise PolicyError("uploader does not match agent identity")
         if type(item["private"]) is not bool or type(item["shared"]) is not bool:
             raise PolicyError("access flags must be booleans")
         agents[agent_id] = AgentRule(uploader, item["private"], item["shared"])

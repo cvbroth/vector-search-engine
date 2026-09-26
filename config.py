@@ -17,7 +17,10 @@ class KnowledgeScope:
     area: str
 
     def __post_init__(self) -> None:
-        if (self.name, self.area) not in {("chen", "private"), ("family", "shared")}:
+        if (self.name, self.area) not in {
+            ("chen", "private"), ("liang", "private"), ("azl", "private"),
+            ("family", "shared"),
+        }:
             raise ValueError("unsupported knowledge scope layout")
 
     @property
@@ -41,9 +44,20 @@ DEFAULT_SCOPE = "chen"
 KNOWLEDGE_SCOPES: Mapping[str, KnowledgeScope] = MappingProxyType(
     {
         "chen": KnowledgeScope("chen", "private"),
+        "liang": KnowledgeScope("liang", "private"),
+        "azl": KnowledgeScope("azl", "private"),
         "family": KnowledgeScope("family", "shared"),
     }
 )
+
+# Trusted identities, not caller-supplied scope names. A policy may disable access,
+# but it cannot grant one user's private knowledge to another identity.
+PRIVATE_SCOPE_BY_AGENT: Mapping[str, str] = MappingProxyType({
+    "main": "chen", "chen": "chen", "liang": "liang", "ziling": "azl",
+})
+PRIVATE_SCOPE_BY_UPLOADER: Mapping[str, str] = MappingProxyType({
+    "chen": "chen", "liang": "liang", "azl": "azl",
+})
 
 EMBEDDING_URL = "http://127.0.0.1:19433/v1/embeddings"
 EMBEDDING_MODEL = "EmbeddingGemma 300M"
@@ -82,7 +96,7 @@ validate_relevance_thresholds(
 
 
 def get_scope(name: str) -> KnowledgeScope:
-    """Only two hard-coded layouts are available; callers cannot pass a path."""
+    """Only four hard-coded layouts are available; callers cannot pass a path."""
     try:
         scope = KNOWLEDGE_SCOPES[name]
     except (KeyError, TypeError) as exc:

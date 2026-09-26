@@ -91,7 +91,7 @@ class KnowledgeQueryServiceTests(unittest.TestCase):
             b"{not json",
             b"{}",
             b'{"query":"","scopes":["family"]}',
-            b'{"query":"q","scopes":["liang"]}',
+            b'{"query":"q","scopes":["ziling"]}',
             b'{"query":"q","scopes":["family"],"top_k":0}',
             b'{"query":"q","scopes":["family"],"top_k":true}',
             b'{"query":"q","scopes":["family"],"source_path":"/etc/passwd"}',

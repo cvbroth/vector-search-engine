@@ -4,7 +4,7 @@
   "agents": {
     "main": { "private_scope": "chen", "shared": true },
     "chen": { "private_scope": "chen", "shared": true },
-    "liang": { "private_scope": null, "shared": true },
-    "ziling": { "private_scope": null, "shared": true }
+    "liang": { "private_scope": "liang", "shared": true },
+    "ziling": { "private_scope": "azl", "shared": true }
   }
 }

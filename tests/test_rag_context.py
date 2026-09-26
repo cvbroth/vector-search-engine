@@ -219,7 +219,7 @@ class RagContextTests(unittest.TestCase):
         self.assertIn("database unavailable", errors.getvalue())
 
         with self.assertRaisesRegex(ValueError, "unsupported knowledge scope"):
-            build_rag_context("问题", ["liang"])
+            build_rag_context("问题", ["ziling"])
         with self.assertRaisesRegex(ValueError, "unique"):
             build_rag_context("问题", ["chen", "chen"])
         with (
@@ -227,7 +227,7 @@ class RagContextTests(unittest.TestCase):
             redirect_stderr(io.StringIO()),
         ):
             with self.assertRaises(SystemExit) as exc:
-                main(["问题", "--scope", "liang"])
+                main(["问题", "--scope", "ziling"])
         self.assertEqual(exc.exception.code, 2)
         self.assertEqual(output.getvalue(), "")
 

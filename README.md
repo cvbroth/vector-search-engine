@@ -4,7 +4,7 @@
 
 | 文件 | 职责 |
 | --- | --- |
-| `config.py` | `chen` / `family` 白名单、各自的文档/数据库/日志路径及本地 Embedding 配置 |
+| `config.py` | `chen` / `liang` / `azl` / `family` 白名单、固定身份映射、各自的文档/数据库/日志路径及本地 Embedding 配置 |
 | `parsers.py` | 从 `.md`、`.txt`、`.pdf`、`.docx` 提取文本；PDF 保留可提取文本的页码 |
 | `chunker.py` | 按标题、段落、句子组织 chunk，并保留来源元数据与 overlap |
 | `embeddings.py` | 批量请求 `127.0.0.1:19433` 的既有 Embedding 服务，验证 768 维结果 |
@@ -43,15 +43,19 @@ python -m pip install -r requirements.txt
 ```bash
 python ingest.py
 python ingest.py --scope chen
+python ingest.py --scope liang
+python ingest.py --scope azl
 python ingest.py --scope family
 python search.py "问题"
 python search.py "问题" --top-k 5
 python search.py "问题" --scope chen
+python search.py "问题" --scope liang
+python search.py "问题" --scope azl
 python search.py "问题" --scope family
 python search.py "赤狐星云" --scope family --debug-scores
 ```
 
-`--scope` 只接受 `chen` 或 `family`；省略时默认 `chen`，所以原有不带参数的 `kb-chen-ingest.service` 调用方式保持兼容。CLI 搜索仍只查询一个库，不会自动混合两个 scope。导入只处理四种支持的扩展名。失败的文件保留旧索引（如有）；扫描不完整时停止删除清理。
+`--scope` 只接受 `chen`、`liang`、`azl` 或 `family`；省略时默认 `chen`，所以原有不带参数的 `kb-chen-ingest.service` 调用方式保持兼容。CLI 搜索仍只查询一个库，不会自动混合其他 scope。导入只处理四种支持的扩展名。失败的文件保留旧索引（如有）；扫描不完整时停止删除清理。
 
 复用多库搜索时可从 Python 调用：
 
@@ -167,7 +171,7 @@ python kb_service.py --socket /run/knowledge-base/backend.sock --socket-mode 066
 {"query":"家庭共享服务器叫什么？","scopes":["family"],"top_k":5}
 ```
 
-成功响应为现有 RAG Context schema `1.0` 的完整 JSON，包括 `retrieval_status`、`evidence_count` 和 `evidence`。`GET /health` 仅返回 `{"status":"ok","schema_version":"1.0"}`，表示进程在响应，**不证明**数据库或 Embedding 服务可用。其他路由不存在，也没有任意路径、数据库名或文件名参数。请求体最多 64 KiB，query 最多 4096 个 Unicode 字符；scope 只能是 `chen` / `family`，`top_k` 为 1–50，省略时为 5。
+成功响应为现有 RAG Context schema `1.0` 的完整 JSON，包括 `retrieval_status`、`evidence_count` 和 `evidence`。`GET /health` 仅返回 `{"status":"ok","schema_version":"1.0"}`，表示进程在响应，**不证明**数据库或 Embedding 服务可用。其他路由不存在，也没有任意路径、数据库名或文件名参数。请求体最多 64 KiB，query 最多 4096 个 Unicode 字符；scope 只能是固定的 `chen` / `liang` / `azl` / `family`，`top_k` 为 1–50，省略时为 5。Backend socket 不做 Agent 授权，只能供可信 Broker/诊断进程使用。
 
 | 情况 | HTTP 状态 | 响应含义 |
 | --- | --- | --- |
@@ -206,15 +210,17 @@ WantedBy=multi-user.target
 
 Backend socket **没有 Agent 授权**，只能让 Broker 与可信宿主机诊断进程连接，不能挂载给 OpenClaw 容器。示例 `0660` 仅允许 owner/group 连接；目录 `0750` 也必须控制遍历权限。不要使用 `0777`。服务启动时仅清理已确认失效的旧 socket，并尽可能在退出时清理自己的 socket。上面的 systemd 示例只是后端示例，不表示服务器已迁移。
 
+**多用户部署注意：**上面沿用旧配置 `User=chen`，不能在 `liang` / `azl` 的 Source 与 state 都保持私人 `0700` 时原样服务四库。部署前需决定可信查询后端的运行身份及对三个私库的最小只读 ACL/目录遍历权限，并单独核对 SQLite 只读访问和 Broker 的 socket 连接权限；不要通过向所有用户开放私人目录来“修复”查询。单一后端若能读取三库，其进程身份本身就是高信任主体，不能宣称对已攻陷的后端仍有强 OS 级隔离。这里没有创建账户、ACL 或 unit，也没有在 NAS 验证。
+
 ## KB Policy Broker：Agent 到 scope 的中央映射
 
 Broker 是独立的宿主机本地 Unix socket 服务，固定监听 `/run/knowledge-broker/query.sock`，从 `/etc/knowledge-broker/policy.json` 读取 ACL，转发到 `/run/knowledge-base/backend.sock`。它不监听 TCP，也不直接检索数据库或修改索引。Broker 的 policy 示例见 [`examples/knowledge-broker-policy.json`](examples/knowledge-broker-policy.json)。实际服务器上的文件、目录、socket 权限和服务部署需单独规划；本仓库没有替用户操作服务器。
 
-Policy schema `1.0` 顶层只包含 `schema_version`、`shared_scope`（当前固定为已配置的 `family`）及 `agents`。每个 Agent 映射为 `{ "private_scope": "chen" | null, "shared": true | false }`。示例中 `main`、`chen` 的 private 都指向 `chen`；`liang`、`ziling` 的 private 为 `null`；四者的 shared 都指向 `family`。Agent ID 不写死在 Python 代码中。未知 Agent、缺失 policy、非法 schema、未知 scope 都 fail closed；未来只有当后端正式增加 `liang`/`ziling` 私库配置后，policy 才能把对应 `private_scope` 改为这些值，模型工具接口无需改变。
+Policy schema `1.0` 顶层只包含 `schema_version`、`shared_scope`（固定为 `family`）及 `agents`。每个 Agent 映射为 `{ "private_scope": <自己的固定私库名> | null, "shared": true | false }`。示例中 `main`、`chen` → `chen`，`liang` → `liang`，`ziling` → `azl`；四者可用 `family`。代码在加载 policy 时固定校验这些 Agent 身份与私库的配对；`null` 仍可关闭私人查询，但不能把一个人的私库映射给另一个人。未知 Agent、缺失 policy、非法 schema、未知 scope 或身份不匹配都 fail closed。`ziling` 是 OpenClaw Agent ID，`azl` 才是 NAS 私库/uploader；**没有** `ziling` scope。此限制有意收窄旧版 policy 的自由映射能力，以避免普通配置错误造成跨用户泄露；未来增加身份须同时审核代码与 policy。
 
 Broker 只接受 `POST /v1/private-context` 或 `POST /v1/shared-context`，请求体为 `{"agent_id":"chen","query":"问题","top_k":5}`。前者用 policy 的该 Agent `private_scope`；后者先检查 `shared=true`，再用 policy `shared_scope`。由 Broker 而非模型生成后端的 `scopes=[...]`。`GET /health` 只返回状态与 schema 版本，不暴露 ACL/用户列表。请求字段严格限制为 `agent_id`、`query`、`top_k`；query 最多 4096 字符，top_k 为 1–10。授权失败返回 403，输入错误 400；正常无证据返回 200/REJECT/空 evidence；后端超时或故障返回 5xx，绝不伪装成 REJECT。
 
-Broker 先严格验证 backend 的内部 RAG Context（其中仍有 `scope`、`scopes`、`source_path`），然后明确投影为给插件/模型的 schema `1.0`。顶层只含 `schema_version`、`query`、`retrieval_status`、`evidence_count`、`evidence`；每条 evidence 只含 `rank`、`fused_score`、`semantic_score`、`semantic_distance`、`lexical_match`、`lexical_score`、`relevance_decision`、`filename`、`page`、`chunk_index`、`text`。外部结果与插件 outputSchema 都不含内部 scope 名或 `source_path`。后端 `kb_service.py` 的 RAG Context 协议保持原样。文档正文或文件名本身若提到这些普通词语，不属于结构字段清理范围。
+Broker 先严格验证 backend 的内部 RAG Context（其中仍有 `scope`、`scopes`、`source_path`，且 evidence 路径必须在已授权 scope 的 Source 根目录内），然后明确投影为给插件/模型的 schema `1.0`。顶层只含 `schema_version`、`query`、`retrieval_status`、`evidence_count`、`evidence`；每条 evidence 只含 `rank`、`fused_score`、`semantic_score`、`semantic_distance`、`lexical_match`、`lexical_score`、`relevance_decision`、`filename`、`page`、`chunk_index`、`text`。外部结果与插件 outputSchema 都不含内部 scope 名或 `source_path`。后端 `kb_service.py` 的 RAG Context 协议保持原样。文档正文或文件名本身若提到这些普通词语，不属于结构字段清理范围。
 
 Broker 的 systemd unit 示例（`knowledge-broker.service`，**未在真实服务器部署**）：
 
@@ -261,9 +267,9 @@ OpenClaw 插件只请求 Broker socket，模型仅看到 `knowledge_private(quer
 
 正式发布使用目标目录内独占临时文件：写入后对打开的文件描述符显式 `fchmod(0640)` 并 `fsync`。首选 Linux `renameat2(RENAME_NOREPLACE)` 将同目录 temp 原子改名为 final；底层 `rename_noreplace()` 保持严格语义，不自行降级。若它明确返回 `UnsupportedPublicationError`（例如 mergerfs 挂载层对该 flag 返回 `EINVAL`），**仅 Importer 已持有同一 scope 的 `publish.lock` 时**，再次 `lstat` 确认 final 不存在，才执行同目录普通 `os.rename(temp, final)`；final 已存在（包括 symlink）则拒绝并走 duplicate/conflict 路径。其他 I/O 错误不触发 fallback。两级策略均不使用 hard link、`os.replace`，不绕过 `/srv/storage` 直接写底层 branch，因此仍遵循 mergerfs 的 branch placement policy；发布后 `fsync` 目标目录。final 从首次可见起就是单链接普通文件（`st_nlink == 1`），不会出现旧版 `link + unlink` 的瞬时双链接窗口。Importer **不 chmod Inbox 原文件**。private Source 的目录访问控制仍由其私有目录决定；shared Source 能否被其他用户读取，还取决于目录遍历权限、属组与 setgid/ACL。这种先复制到目标目录的方式也适用于 Inbox 与 Source 不在同一 filesystem；中途失败不会把半写入内容作为 final 文件暴露。fallback 的 no-clobber 保证**来自单一受信任写入路径及所有参与者遵守 per-scope `publish.lock`**，不是内核级 `RENAME_NOREPLACE`；不受锁约束的外部写入者仍可能在 `lstat` 与普通 rename 之间抢占 final，因此必须禁止其他进程绕过 Importer 写该 Source。真实 NAS 上的 mergerfs 普通 rename、目录 `fsync`、权限及容量行为仍须实测。每个 uploader 使用自己的 `/run/knowledge-import/<uploader>/import.lock` 独占锁：同一用户不能并发导入，不同用户的锁互不阻塞；Linux 使用 `fcntl.flock`。运行用户必须控制自己的锁目录和 Importer DB 目录。
 
-同一 scope 还有两把用途不同的锁：`<scope.state_dir>/publish.lock` 保护 Source 中的 **SHA-256 去重检查到 final 发布**，避免不同 uploader 以不同文件名同时发布相同内容；`<scope.state_dir>/ingest.lock` 由 `ingest_scope()` 自己持有，覆盖完整的扫描、SQLite 更新和删除阶段，因此 Importer、既有 ingest timer、手动 CLI 等调用方都受同一把锁约束。实际路径分别位于 `/var/lib/knowledge-base/private/chen/` 或 `/var/lib/knowledge-base/shared/family/` 下。锁顺序为「每用户 Importer 锁 → scope 发布锁 → 释放发布锁 → scope ingest 锁」，不会嵌套持有两个 scope 锁。锁文件只是持久的同步入口，不以文件存在与否判断占用；进程退出后内核释放 `flock`。所有参与者必须使用同一可信 state 目录和这些锁；手工绕过 Importer 直接写 Source 不受发布锁保护。
+同一 scope 还有两把用途不同的锁：`<scope.state_dir>/publish.lock` 保护 Source 中的 **SHA-256 去重检查到 final 发布**，避免不同 uploader 以不同文件名同时发布相同内容；`<scope.state_dir>/ingest.lock` 由 `ingest_scope()` 自己持有，覆盖完整的扫描、SQLite 更新和删除阶段，因此 Importer、既有 ingest timer、手动 CLI 等调用方都受同一把锁约束。实际路径分别位于 `/var/lib/knowledge-base/private/{chen,liang,azl}/` 或 `/var/lib/knowledge-base/shared/family/` 下。锁顺序为「每用户 Importer 锁 → scope 发布锁 → 释放发布锁 → scope ingest 锁」，不会嵌套持有两个 scope 锁。锁文件只是持久的同步入口，不以文件存在与否判断占用；进程退出后内核释放 `flock`。所有参与者必须使用同一可信 state 目录和这些锁；手工绕过 Importer 直接写 Source 不受发布锁保护。
 
-Importer policy 固定由 `--policy` 指向 JSON，格式示例见 [`examples/knowledge-import-policy.json`](examples/knowledge-import-policy.json)；示例文件含多个 uploader 仅用于说明格式，生产实例建议拆成单 uploader policy。顶层必须有 `schema_version="1.0"`、正整数 `max_file_size_bytes`、`routes`；每位上传者必须显式配置 `private` 和 `shared`。启用的 route 必须含 `enabled=true`、当前 `config.py` 已知的 `scope`、绝对 `destination`，且 destination 必须**精确等于**该 scope 的正式 Source 根目录，不能指向 Inbox 或任意其他路径。关闭的 route 仅写 `{"enabled":false}`。非法/缺失 policy、重复键、未知 scope、无效或不在 policy 中的 `--uploader`、路径不匹配均拒绝启动；CLI 不接受任意 source/destination/scope/state/lock 参数。当前只启用 `chen`、`family` 两个知识库 scope；`liang`、`azl` 的 private route 仍关闭。
+Importer policy 固定由 `--policy` 指向 JSON，格式示例见 [`examples/knowledge-import-policy.json`](examples/knowledge-import-policy.json)；示例文件含多个 uploader 仅用于说明格式，生产实例建议拆成单 uploader policy。顶层必须有 `schema_version="1.0"`、正整数 `max_file_size_bytes`、`routes`；每位上传者必须显式配置 `private` 和 `shared`。启用的 route 必须含 `enabled=true`、当前 `config.py` 已知的 `scope`、绝对 `destination`，且 destination 必须**精确等于**该 scope 的正式 Source 根目录，不能指向 Inbox 或任意其他路径。私人 route 还必须是固定配对 `chen→chen`、`liang→liang`、`azl→azl`；共享 route 只能为 `family`。关闭的 route 仅写 `{"enabled":false}`。非法/缺失 policy、重复键、未知 uploader/scope、身份不匹配、路径不匹配均拒绝启动；CLI 不接受任意 source/destination/scope/state/lock 参数。
 
 CLI 每次只扫描一轮，`--once` 可显式写出；无 daemon/watch loop。生产多用户实例应显式指定 `--uploader`，并让 policy 只包含该 Unix/Inbox 用户的 routes：
 
@@ -275,7 +281,7 @@ python knowledge_importer.py --policy /etc/knowledge-import/azl.json --uploader 
 
 不传 `--uploader` 保留 V2.1 单实例开发/测试模式：扫描 policy 中所有用户，使用旧的 `/var/lib/knowledge-import/imports.db` 和 `/run/knowledge-import/import.lock`；**不要用于生产多用户权限隔离**。`--dry-run` 会扫描、复核稳定性、解析并判断 `WOULD_IMPORT` / `WOULD_REJECTED` / `WOULD_DUPLICATE` / `WOULD_CONFLICT`，但不会移动文件、创建或修改 `imports.db`、调用 ingest。普通导入成功后 Inbox 文件消失；再次运行空 Inbox 不重复建记录或重复索引。Importer 的 Python API 是 `load_policy()` 加 `KnowledgeImporter(policy, uploader="chen").run()`，受信任调用方和本地测试可以注入临时状态库/锁路径。
 
-规划的独立 policy 为 `/etc/knowledge-import/chen.json`、`/etc/knowledge-import/liang.json`、`/etc/knowledge-import/azl.json`，每份只含对应 uploader。三者的 route 分别是：`chen: private→chen, shared→family`；`liang: private→disabled, shared→family`；`azl: private→disabled, shared→family`。这里 `chen`/`family` 是现有知识库 scope，`liang`/`azl` **不是**已启用的 private scope。OpenClaw Agent 名 `ziling` 与 Unix/Inbox 用户 `azl` 不同；本层只认真实 uploader 身份，未来由尚未实现的 Import Broker 负责 `ziling → azl` 映射。不要把 Agent 名直接作为 Inbox 用户猜测。
+规划的独立 policy 为 `/etc/knowledge-import/chen.json`、`/etc/knowledge-import/liang.json`、`/etc/knowledge-import/azl.json`，每份只含对应 uploader。三者的 route 分别是：`chen: private→chen, shared→family`；`liang: private→liang, shared→family`；`azl: private→azl, shared→family`。OpenClaw Agent 名 `ziling` 与 Unix/Inbox 用户 `azl` 不同；Importer 只认真实 uploader 身份，Import Broker 固定校验 `ziling → azl`。不要把 Agent 名直接作为 Inbox 用户猜测。
 
 systemd template 仅供代码验收后的单独部署规划，**未创建 unit，也未修改或测试真实服务器**：
 
@@ -315,11 +321,13 @@ Unit=knowledge-import@%i.service
 WantedBy=timers.target
 ```
 
+部署时分别启用 `knowledge-import@chen.timer`、`knowledge-import@liang.timer`、`knowledge-import@azl.timer`；对应实例是同名 `.service`。不要创建 `knowledge-import@ziling`：`ziling` 只是 Agent ID，实际 Unix/uploader 用户是 `azl`。各实例必须使用只含本人的 policy，并确认其私有 Source/state/Inbox 仅本人可访问。
+
 [systemd.exec 手册](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html)允许 `StateDirectory=`、`RuntimeDirectory=` 使用相对嵌套目录（如 `foo/bar`），管理器创建其父目录，并为最内层目录设置服务用户/组和 Mode；`RuntimeDirectory` 最内层会在 oneshot 停止后移除，下次运行重建。仍须在实际服务器核对 systemd 版本、unit 解析结果、目录属主与权限、timer 行为及失败恢复。不要把上面示例视为已部署成功。
 
 每个私人 Inbox 应保持 `/srv/storage/ai-inbox/{chen,liang,azl}` 分别由同名 Unix 用户拥有，目录模式 `0700`；不要为方便 Importer 把所有 Inbox 改成 `0770`，也不要让 `chen` 读取 `liang` 的 Inbox。每个实例只需本人的 Inbox 读写、本人 state/runtime 目录和 policy 读取权限。`family` 共享 Source 目录须由 `nas-users` 等经审核的组持有、启用 setgid，并给予该组所需的目录遍历/读写权限；这样新发布的 `0640` 文件才能继承正确属组并供授权 indexer 读取。`UMask=0077` 可以继续保护其他私有状态，但不会覆盖 Source 的显式 `fchmod(0640)`。private Source 和 Inbox 的目录仍须保持私人访问控制。
 
-`family` 派生 state 目录 `/var/lib/knowledge-base/shared/family` 及 `index/`、`logs/` 也须预先按受信任组配置 setgid/权限，让所有获授权的 family ingest 用户能打开同一个 `0660` 锁文件并实际读写 SQLite 主库、日志及其临时/journal 文件。锁代码不会自动修复目录属组或数据库/日志的权限；`UMask=0077` 也可能使这些派生文件成为仅 owner 可读写。部署前必须在真实主机核验并设计受控 ACL/属组、SQLite 并发和 mergerfs 行为；若无法满足，不要启用多用户轮流执行 family ingest。不要靠放宽私人 Inbox 权限解决。服务用户无需 root。未来若加 OpenClaw 导入工具，可提供 `knowledge_import_private` / `knowledge_import_shared`，只接收可信 attachment handle；模型不应传任意路径、scope、agent_id 或 destination。本次没有实现 Import Broker、插件、Web 上传或 OCR。
+`family` 派生 state 目录 `/var/lib/knowledge-base/shared/family` 及 `index/`、`logs/` 也须预先按受信任组配置 setgid/权限，让所有获授权的 family ingest 用户能打开同一个 `0660` 锁文件并实际读写 SQLite 主库、日志及其临时/journal 文件。锁代码不会自动修复目录属组或数据库/日志的权限；`UMask=0077` 也可能使这些派生文件成为仅 owner 可读写。部署前必须在真实主机核验并设计受控 ACL/属组、SQLite 并发和 mergerfs 行为；若无法满足，不要启用多用户轮流执行 family ingest。不要靠放宽私人 Inbox 权限解决。服务用户无需 root。OpenClaw 导入工具只接收受信任附件；模型不应传任意路径、scope、agent_id 或 destination。这里不包含 Web 上传或 OCR。
 
 ## 可信聊天附件排队（未部署）
 
@@ -327,7 +335,7 @@ OpenClaw 2026.9.4 固定依赖的公开 Plugin SDK 提供 `inbound_claim` Hook�
 
 新链路与查询链路独立：`knowledge_import_private()` / `knowledge_import_shared()` 的模型参数严格为 `{}`；工具从可信 `toolContext.agentId` 和 `toolContext.sessionKey` 选取当前会话最近一条单附件消息。多附件返回 `SELECTION_REQUIRED`，没有 READY 附件返回 `NO_ATTACHMENT`。进程内 Registry 最多保留 100 个会话、每会话最多 8 个附件、TTL 30 分钟；重启即丢失。已经发起传输的附件不会自动重发：超时可能意味着 Broker 已接收但响应丢失，工具返回 `BROKER_ERROR`，再次调用返回 `ALREADY_QUEUED`，需要人工核对 Inbox。此阶段**不会主动提示用户入库**，只在用户调用工具时排队。
 
-发送前插件对可信暂存路径 `lstat` 并以 `O_NOFOLLOW` 打开，核对打开 fd 的 dev/inode/size/mtime、普通文件类型、扩展名和 100 MiB 上限。附件正文走固定 Unix socket `/run/knowledge-import-broker/import.sock` 的 HTTP raw body 流，不使用 base64 JSON、不由模型指定路径、URL、scope、uploader 或目标。Broker 的独立固定 policy 示例是 [`examples/knowledge-import-broker-policy.json`](examples/knowledge-import-broker-policy.json)：`main`、`chen` 映射 `chen` 且允许 private/shared；`liang` 只允许 shared；`ziling` 映射 `azl` 且只允许 shared；未知 Agent 拒绝。Broker 的 `max_file_size_bytes` 必须不高于对应用户 Importer policy 的限制，当前示例均为 100 MiB。插件 `imports` 配置缺失时两个写入工具完全隐藏；现有 `agents.<id>.private/shared` 查询配置**不会自动继承写权限**。Broker policy 才是最终 ACL，插件配置仅是工具可见性控制。
+发送前插件对可信暂存路径 `lstat` 并以 `O_NOFOLLOW` 打开，核对打开 fd 的 dev/inode/size/mtime、普通文件类型、扩展名和 100 MiB 上限。附件正文走固定 Unix socket `/run/knowledge-import-broker/import.sock` 的 HTTP raw body 流，不使用 base64 JSON、不由模型指定路径、URL、scope、uploader 或目标。Broker 的独立固定 policy 示例是 [`examples/knowledge-import-broker-policy.json`](examples/knowledge-import-broker-policy.json)：`main`、`chen` 映射 `chen`，`liang` 映射 `liang`，`ziling` 映射 `azl`，均允许 private/shared；加载 policy 时也校验这些固定配对，未知 Agent 或误配拒绝。Broker 的 `max_file_size_bytes` 必须不高于对应用户 Importer policy 的限制，当前示例均为 100 MiB。插件 `imports` 配置缺失时两个写入工具完全隐藏；现有 `agents.<id>.private/shared` 查询配置**不会自动继承写权限**。Broker policy 才是最终 ACL，插件配置仅是工具可见性控制。
 
 宿主机 Broker 只允许固定路由，把流式正文写入 `/srv/storage/ai-inbox/<policy 映射 uploader>/private|shared` 的同目录独占临时文件，计算 SHA-256，`fchown` 至目标 Unix 用户、`fchmod(0600)`、`fsync` 后改名为随机队列文件，再 `fsync` 目录。它不解析、不中转到 Source、不执行附件，也不触碰 SQLite、Embedding 或 ingest。`QUEUED` 只表示 Inbox 排队成功，**不是 `INDEXED`**；后续仍由现有 `knowledge_import@<user>.timer/service` 与 `knowledge_importer.py` 处理。单一 Broker 串行处理请求，随机 final 名并复查是否存在；普通 rename 的防碰撞依赖这个受控写入路径及私人 Inbox 的目录权限，不能防护绕过 Broker 的恶意并发写入者。不要将 Inbox、Source 或 backend.sock 挂载到 OpenClaw，只向容器提供 Import Broker socket。
 
@@ -364,7 +372,7 @@ WantedBy=multi-user.target
 
 ## 相关度标定
 
-准备一个 UTF-8 JSON 数组；每条查询必须标注 `query`、白名单 scope（`chen` 或 `family`）和布尔值 `expected_relevant`：
+准备一个 UTF-8 JSON 数组；每条查询必须标注 `query`、白名单 scope（`chen`、`liang`、`azl` 或 `family`）和布尔值 `expected_relevant`：
 
 ```json
 [
@@ -386,11 +394,13 @@ python calibrate_relevance.py relevance_cases.json --output results.json
 
 ## 数据库结构
 
-两个 scope 的数据库、日志完全独立：
+四个 scope 的数据库、日志完全独立：
 
 | scope | 文档根目录 | 数据库 | 日志目录 |
 | --- | --- | --- | --- |
 | `chen` | `/srv/storage/knowledge/private/chen` | `/var/lib/knowledge-base/private/chen/index/knowledge.db` | `/var/lib/knowledge-base/private/chen/logs` |
+| `liang` | `/srv/storage/knowledge/private/liang` | `/var/lib/knowledge-base/private/liang/index/knowledge.db` | `/var/lib/knowledge-base/private/liang/logs` |
+| `azl` | `/srv/storage/knowledge/private/azl` | `/var/lib/knowledge-base/private/azl/index/knowledge.db` | `/var/lib/knowledge-base/private/azl/logs` |
 | `family` | `/srv/storage/knowledge/shared/family` | `/var/lib/knowledge-base/shared/family/index/knowledge.db` | `/var/lib/knowledge-base/shared/family/logs` |
 
 | 表 | 内容 |
@@ -409,7 +419,7 @@ python calibrate_relevance.py relevance_cases.json --output results.json
 - PDF 页码从 1 开始；扫描版 PDF 若无可提取文本会报错，不包含 OCR。其他格式的 `page` 为 `NULL`。
 - FTS5 使用 trigram 支持中文片段；少于三个字符的独立查询词无法进入该路检索，但仍可由语义检索返回结果。
 - 两路候选各按自身名次进入 RRF，原始 BM25 分数与向量距离不会直接相加。
-- scope 仅有固定的 `chen` / `family` 布局，CLI 和 Python API 都不接受任意目录；两库不共享 SQLite 文件。源目录、数据库及日志路径的已有符号链接组件会被拒绝；文档读取还逐级使用 `O_NOFOLLOW`，拒绝 `..` 和硬链接文件。搜索结果也必须属于当前 scope 的固定源目录。不启用 `liang`、`azl`。
+- scope 仅有固定的 `chen` / `liang` / `azl` / `family` 布局，CLI 和 Python API 都不接受任意目录；四库不共享 SQLite 文件。源目录、数据库及日志路径的已有符号链接组件会被拒绝；文档读取还逐级使用 `O_NOFOLLOW`，拒绝 `..` 和硬链接文件。搜索结果也必须属于当前 scope 的固定源目录。
 - 程序仅通过本机 loopback HTTP 调用已存在的 Embedding 服务，不加载模型。
 - Embedding 模型或维度变更时需重新建立索引；V1 不实现模型迁移或数据库迁移。
-- 新增 `family` 后需在实际服务器上验证目录权限、挂载、日志/数据库创建及两个 scope 的隔离。索引与日志目录须由可信运行用户控制，不应允许其他本地用户并发替换路径；符号链接检查不能替代正确的目录权限。这里不代表已运行过服务器测试。
+- 部署新增 `liang` / `azl` 前需在实际服务器上验证私人 Source、state、index、logs、锁与 Inbox 的用户权限，以及四个 scope 的隔离。索引与日志目录须由可信运行用户控制，不应允许其他本地用户并发替换路径；符号链接检查不能替代正确的目录权限。这里不代表已运行过服务器测试。

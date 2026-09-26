@@ -6,7 +6,7 @@ import { pathToFileURL } from "node:url";
 const DEFAULT_SOCKET = "/run/knowledge-base/backend.sock";
 const MAX_QUERY_CHARS = 4096;
 const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
-const ALLOWED_SCOPES = new Set(["chen", "family"]);
+const ALLOWED_SCOPES = new Set(["chen", "liang", "azl", "family"]);
 
 export function parseArgs(argv) {
   let query;
@@ -36,7 +36,7 @@ export function parseArgs(argv) {
   }
   if (!scopes.length || scopes.some((scope) => !ALLOWED_SCOPES.has(scope)) ||
       new Set(scopes).size !== scopes.length) {
-    throw new Error("At least one unique --scope chen|family is required");
+    throw new Error("At least one unique --scope chen|liang|azl|family is required");
   }
   if (!Number.isInteger(topK) || topK < 1 || topK > 50) {
     throw new Error("--top-k must be an integer from 1 to 50");

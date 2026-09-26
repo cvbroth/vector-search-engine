@@ -19,8 +19,8 @@ POLICY = {
     "agents": {
         "main": {"private_scope": "chen", "shared": True},
         "chen": {"private_scope": "chen", "shared": True},
-        "liang": {"private_scope": None, "shared": True},
-        "ziling": {"private_scope": None, "shared": True},
+        "liang": {"private_scope": "liang", "shared": True},
+        "ziling": {"private_scope": "azl", "shared": True},
     },
 }
 
@@ -59,7 +59,7 @@ def context(status: str, query: str, scope: str) -> dict:
         "semantic_score": 0.75, "semantic_distance": 0.25,
         "lexical_match": True, "lexical_score": -0.1,
         "relevance_decision": status,
-        "source_path": f"/srv/storage/knowledge/{'private/chen' if scope == 'chen' else 'shared/family'}/test.md",
+        "source_path": f"/srv/storage/knowledge/{'shared/family' if scope == 'family' else 'private/' + scope}/test.md",
         "filename": "test.md", "page": None, "chunk_index": 0,
         "text": "SECRET EVIDENCE CONTENT",
     }]
@@ -78,10 +78,9 @@ class BrokerTests(unittest.TestCase):
         )
 
     def test_mapping_and_denial(self) -> None:
-        for agent in ("main", "chen"):
-            self.assertEqual(self.policy.resolve(agent, "PRIVATE"), "chen")
-        for agent in ("liang", "ziling"):
-            self.assertIsNone(self.policy.resolve(agent, "PRIVATE"))
+        for agent, scope in (("main", "chen"), ("chen", "chen"),
+                             ("liang", "liang"), ("ziling", "azl")):
+            self.assertEqual(self.policy.resolve(agent, "PRIVATE"), scope)
         for agent in POLICY["agents"]:
             self.assertEqual(self.policy.resolve(agent, "SHARED"), "family")
         self.assertIsNone(self.policy.resolve("unknown", "SHARED"))
@@ -97,26 +96,23 @@ class BrokerTests(unittest.TestCase):
             return context("ACCEPT", query, scope)
 
         with patch.object(broker, "forward_context", side_effect=fake_forward) as forward:
-            for agent in ("main", "chen"):
+            for agent, expected_scope in (("main", "chen"), ("chen", "chen"),
+                                          ("liang", "liang"), ("ziling", "azl")):
                 status, payload = request(self.policy, "/v1/private-context",
                                           {"agent_id": agent, "query": "问题", "top_k": 3})
                 self.assertEqual(status, 200)
                 self.assertEqual(payload["retrieval_status"], "ACCEPT")
+                self.assertEqual(resolved[-1], expected_scope)
                 self.assertNotIn("scopes", payload)
                 self.assertNotIn("scope", payload["evidence"][0])
                 self.assertNotIn("source_path", payload["evidence"][0])
-            for agent in ("liang", "ziling"):
-                status, payload = request(self.policy, "/v1/private-context",
-                                          {"agent_id": agent, "query": "问题", "top_k": 3})
-                self.assertEqual(status, 403)
-                self.assertEqual(payload, {"error": "private_knowledge_not_authorized"})
             for agent in POLICY["agents"]:
                 status, payload = request(self.policy, "/v1/shared-context",
                                           {"agent_id": agent, "query": "问题", "top_k": 3})
                 self.assertEqual(status, 200)
                 self.assertNotIn("scopes", payload)
-            self.assertEqual(forward.call_count, 6)
-            self.assertEqual(resolved, ["chen", "chen", "family", "family", "family", "family"])
+            self.assertEqual(forward.call_count, 8)
+            self.assertEqual(resolved, ["chen", "chen", "liang", "azl", "family", "family", "family", "family"])
 
     def test_unknown_missing_agent_and_disabled_shared(self) -> None:
         with patch.object(broker, "forward_context") as forward:
@@ -165,7 +161,7 @@ class BrokerTests(unittest.TestCase):
         with patch.object(broker, "forward_context", return_value=context("ACCEPT", "secret query", "chen")):
             with self.assertLogs(broker.LOGGER, level="INFO") as logs:
                 request(self.policy, "/v1/private-context", {"agent_id": "main", "query": "secret query"})
-                request(self.policy, "/v1/private-context", {"agent_id": "liang", "query": "secret query"})
+                request(self.policy, "/v1/private-context", {"agent_id": "unknown", "query": "secret query"})
         entries = [json.loads(line.split("audit ", 1)[1]) for line in logs.output]
         self.assertEqual([entry["decision"] for entry in entries], ["ALLOW", "DENY"])
         self.assertEqual(entries[0]["resolved_scope"], "chen")
@@ -188,6 +184,10 @@ class BrokerTests(unittest.TestCase):
             for invalid in [
                 {**POLICY, "shared_scope": "unknown"},
                 {**POLICY, "agents": {"a": {"private_scope": "liang", "shared": True}}},
+                {**POLICY, "agents": {"liang": {"private_scope": "chen", "shared": True}}},
+                {**POLICY, "agents": {"ziling": {"private_scope": "chen", "shared": True}}},
+                {**POLICY, "agents": {"ziling": {"private_scope": "liang", "shared": True}}},
+                {**POLICY, "agents": {"chen": {"private_scope": "azl", "shared": True}}},
                 {**POLICY, "agents": {"a": {"private_scope": "family", "shared": True}}},
             ]:
                 path.write_text(json.dumps(invalid), encoding="utf-8")
@@ -257,6 +257,23 @@ class BrokerTests(unittest.TestCase):
         rejected = context("REJECT", "q", "family")
         self.assertEqual(broker.validate_backend_context(rejected, "q", "family", 5), rejected)
 
+    def test_private_backend_evidence_cannot_cross_scope(self) -> None:
+        for scope in ("chen", "liang", "azl"):
+            valid = context("ACCEPT", "q", scope)
+            self.assertEqual(broker.validate_backend_context(valid, "q", scope, 5), valid)
+            for other in {"chen", "liang", "azl"} - {scope}:
+                with self.subTest(scope=scope, other=other):
+                    wrong_scope = context("ACCEPT", "q", scope)
+                    wrong_scope["evidence"][0]["scope"] = other
+                    with self.assertRaises(broker.BackendError):
+                        broker.validate_backend_context(wrong_scope, "q", scope, 5)
+                    wrong_path = context("ACCEPT", "q", scope)
+                    wrong_path["evidence"][0]["source_path"] = context(
+                        "ACCEPT", "q", other
+                    )["evidence"][0]["source_path"]
+                    with self.assertRaises(broker.BackendError):
+                        broker.validate_backend_context(wrong_path, "q", scope, 5)
+
     def test_backend_transport_status_malformed_oversized_timeout(self) -> None:
         class FakeResponse:
             def __init__(self, status: int, body: bytes) -> None:
@@ -283,7 +300,7 @@ class BrokerTests(unittest.TestCase):
 
         fake = FakeConnection()
         with patch.object(broker, "UnixBackendConnection", return_value=fake):
-            for scope in ("chen", "family"):
+            for scope in ("chen", "liang", "azl", "family"):
                 fake.response = FakeResponse(200, json.dumps(context("ACCEPT", "q", scope)).encode("utf-8"))
                 broker.forward_context("q", scope, 5)
                 method, endpoint, body, _headers = fake.calls[-1]

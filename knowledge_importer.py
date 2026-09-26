@@ -22,7 +22,8 @@ from types import MappingProxyType
 from typing import Any, Callable, Mapping
 
 from atomic_publish import UnsupportedPublicationError, rename_noreplace
-from config import KNOWLEDGE_SCOPES, SUPPORTED_SUFFIXES, reject_symlink_components
+from config import (KNOWLEDGE_SCOPES, PRIVATE_SCOPE_BY_UPLOADER, SUPPORTED_SUFFIXES,
+                    reject_symlink_components)
 from ingest import ingest_scope
 from parsers import ParseError, parse_document
 from scope_lock import scope_file_lock
@@ -158,7 +159,9 @@ def load_policy(
         raise ImportPolicyError("routes must be a nonempty object")
     routes: dict[str, dict[str, ImportRoute]] = {}
     for user, user_routes in raw_routes.items():
-        if USER_PATTERN.fullmatch(user) is None or not isinstance(user_routes, dict) or set(user_routes) != set(KINDS):
+        if (not isinstance(user, str) or USER_PATTERN.fullmatch(user) is None
+                or user not in PRIVATE_SCOPE_BY_UPLOADER
+                or not isinstance(user_routes, dict) or set(user_routes) != set(KINDS)):
             raise ImportPolicyError("each valid uploader needs private and shared routes")
         resolved: dict[str, ImportRoute] = {}
         for kind in KINDS:
@@ -178,6 +181,10 @@ def load_policy(
                 raise ImportPolicyError("route names an unknown scope")
             if KNOWLEDGE_SCOPES[scope_name].area != kind:
                 raise ImportPolicyError("route access kind does not match scope")
+            if kind == "private" and scope_name != PRIVATE_SCOPE_BY_UPLOADER[user]:
+                raise ImportPolicyError("private scope does not match uploader identity")
+            if kind == "shared" and scope_name != "family":
+                raise ImportPolicyError("shared route must use family scope")
             if not isinstance(target_name, str):
                 raise ImportPolicyError("destination must be an absolute path")
             destination = Path(target_name)

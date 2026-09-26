@@ -25,8 +25,8 @@ class ImportBrokerTests(unittest.TestCase):
         self.policy = broker.ImportBrokerPolicy(1024, MappingProxyType({
             "main": broker.AgentRule("chen", True, True),
             "chen": broker.AgentRule("chen", True, True),
-            "liang": broker.AgentRule("liang", False, True),
-            "ziling": broker.AgentRule("azl", False, True),
+            "liang": broker.AgentRule("liang", True, True),
+            "ziling": broker.AgentRule("azl", True, True),
         }))
 
     def headers(self, agent: str = "main", filename: str = "note.txt", length: int = 4) -> Message:
@@ -42,11 +42,11 @@ class ImportBrokerTests(unittest.TestCase):
     def test_explicit_agent_mapping_and_denials(self) -> None:
         self.assertEqual(self.policy.resolve("main", "private"), "chen")
         self.assertEqual(self.policy.resolve("chen", "shared"), "chen")
+        self.assertEqual(self.policy.resolve("liang", "private"), "liang")
+        self.assertEqual(self.policy.resolve("ziling", "private"), "azl")
         self.assertEqual(self.policy.resolve("ziling", "shared"), "azl")
-        self.assertIsNone(self.policy.resolve("liang", "private"))
-        self.assertIsNone(self.policy.resolve("ziling", "private"))
         self.assertIsNone(self.policy.resolve("unknown", "shared"))
-        for agent, kind in (("liang", "private"), ("ziling", "private"), ("unknown", "shared")):
+        for agent, kind in (("unknown", "private"), ("unknown", "shared")):
             with self.subTest(agent=agent, kind=kind), self.assertRaises(PermissionError):
                 broker.validate_headers(self.headers(agent=agent), self.policy, kind)
 
@@ -54,11 +54,20 @@ class ImportBrokerTests(unittest.TestCase):
         policy_file = self.root / "policy.json"
         policy_file.write_text(json.dumps({
             "schema_version": "1.0", "max_file_size_bytes": 1024,
-            "agents": {"ziling": {"uploader": "azl", "private": False, "shared": True}},
+            "agents": {"ziling": {"uploader": "azl", "private": True, "shared": True}},
         }), encoding="utf-8")
         policy_file.chmod(0o600)
         loaded = broker.load_policy(policy_file)
-        self.assertEqual(loaded.resolve("ziling", "shared"), "azl")
+        self.assertEqual(loaded.resolve("ziling", "private"), "azl")
+        for agent, uploader in (("ziling", "chen"), ("ziling", "liang"),
+                                ("liang", "chen"), ("chen", "azl"), ("unknown", "azl")):
+            with self.subTest(agent=agent, uploader=uploader):
+                policy_file.write_text(json.dumps({
+                    "schema_version": "1.0", "max_file_size_bytes": 1024,
+                    "agents": {agent: {"uploader": uploader, "private": True, "shared": True}},
+                }), encoding="utf-8")
+                with self.assertRaises(broker.PolicyError):
+                    broker.load_policy(policy_file)
         policy_file.write_text('{"schema_version":"1.0","schema_version":"1.0"}', encoding="utf-8")
         with self.assertRaises(broker.PolicyError):
             broker.load_policy(policy_file)
@@ -101,7 +110,7 @@ class ImportBrokerTests(unittest.TestCase):
         return handler, responses
 
     def test_http_authorization_and_broker_failure_are_distinct(self) -> None:
-        for agent, kind in (("unknown", "shared"), ("liang", "private"), ("ziling", "private")):
+        for agent, kind in (("unknown", "shared"), ("unknown", "private")):
             with self.subTest(agent=agent, kind=kind):
                 handler, responses = self.handler(agent, kind)
                 handler.do_POST()
@@ -119,6 +128,18 @@ class ImportBrokerTests(unittest.TestCase):
         self.assertEqual(responses[0][1]["status"], "QUEUED")
         self.assertEqual(queued.call_args.args[3], "azl")
         self.assertEqual(queued.call_args.args[2], self.root / "azl" / "shared")
+        handler, responses = self.handler(agent="ziling", kind="private")
+        with patch.object(broker, "queue_to_inbox", return_value=("kb-test__note.txt", 4, "abcdef123456")) as queued:
+            handler.do_POST()
+        self.assertEqual(responses[0][0], 200)
+        self.assertEqual(queued.call_args.args[3], "azl")
+        self.assertEqual(queued.call_args.args[2], self.root / "azl" / "private")
+        handler, responses = self.handler(agent="liang", kind="private")
+        with patch.object(broker, "queue_to_inbox", return_value=("kb-test__note.txt", 4, "abcdef123456")) as queued:
+            handler.do_POST()
+        self.assertEqual(responses[0][0], 200)
+        self.assertEqual(queued.call_args.args[3], "liang")
+        self.assertEqual(queued.call_args.args[2], self.root / "liang" / "private")
         headers = self.headers()
         headers["Transfer-Encoding"] = "chunked"
         with self.assertRaises(broker.RequestError):

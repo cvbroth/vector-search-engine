@@ -72,8 +72,12 @@ class ImporterTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
         self.inbox = self.root / "inbox"
         self.chen = self.root / "source-chen"
+        self.liang = self.root / "source-liang"
+        self.azl = self.root / "source-azl"
         self.family = self.root / "source-family"
         self.chen.mkdir()
+        self.liang.mkdir()
+        self.azl.mkdir()
         self.family.mkdir()
         self.state = self.root / "state" / "imports.db"
         self.lock = self.root / "runtime" / "import.lock"
@@ -101,7 +105,8 @@ class ImporterTests(unittest.TestCase):
     def load_policy(self) -> ki.ImportPolicy:
         return ki.load_policy(
             self.policy_path, inbox_root=self.inbox,
-            allowed_destinations={"chen": self.chen, "family": self.family},
+            allowed_destinations={"chen": self.chen, "liang": self.liang,
+                                  "azl": self.azl, "family": self.family},
         )
 
     def write(self, name: str, data: bytes | str, *, user: str = "chen", kind: str = "private") -> Path:
@@ -121,6 +126,8 @@ class ImporterTests(unittest.TestCase):
             lock_path=self.lock, settle_seconds=0, dry_run=dry_run,
             publication_lock_paths={
                 "chen": self.root / "scope-chen" / "publish.lock",
+                "liang": self.root / "scope-liang" / "publish.lock",
+                "azl": self.root / "scope-azl" / "publish.lock",
                 "family": self.root / "scope-family" / "publish.lock",
             },
             publication_primitive=ki.rename_noreplace if publication_primitive is None else publication_primitive,
@@ -142,6 +149,8 @@ class ImporterTests(unittest.TestCase):
             lock_path=lock, settle_seconds=0, dry_run=dry_run,
             publication_lock_paths={
                 "chen": self.root / "scope-chen" / "publish.lock",
+                "liang": self.root / "scope-liang" / "publish.lock",
+                "azl": self.root / "scope-azl" / "publish.lock",
                 "family": self.root / "scope-family" / "publish.lock",
             },
             publication_primitive=ki.rename_noreplace if publication_primitive is None else publication_primitive,
@@ -273,6 +282,41 @@ class ImporterTests(unittest.TestCase):
         self.assertTrue((self.family / "shared.txt").exists())
         self.assertEqual(self.calls, ["family"])
         self.assertEqual(len(list((self.inbox / "liang" / "rejected" / "private" / "rejected").glob("*__disabled.txt"))), 1)
+
+    def test_liang_and_azl_private_publication_stays_in_own_source(self) -> None:
+        routes = dict(self.routes)
+        routes["liang"] = {
+            "private": {"enabled": True, "scope": "liang", "destination": str(self.liang)},
+            "shared": self.routes["liang"]["shared"],
+        }
+        routes["azl"] = {
+            "private": {"enabled": True, "scope": "azl", "destination": str(self.azl)},
+            "shared": self.routes["chen"]["shared"],
+        }
+        self.write_policy(routes=routes)
+        self.write("liang.txt", "liang private", user="liang")
+        self.write("azl.txt", "azl private", user="azl")
+        self.assertEqual(self.per_user_importer("liang").run()[0].status, "INDEXED")
+        self.assertEqual(self.per_user_importer("azl").run()[0].status, "INDEXED")
+        self.assertEqual((self.liang / "liang.txt").read_text(), "liang private")
+        self.assertEqual((self.azl / "azl.txt").read_text(), "azl private")
+        self.assertEqual(list(self.chen.iterdir()), [])
+        self.assertEqual(self.calls, ["liang", "azl"])
+
+    def test_private_route_rejects_cross_user_scope_even_with_matching_destination(self) -> None:
+        for uploader, scope, destination in (("liang", "chen", self.chen),
+                                             ("azl", "liang", self.liang),
+                                             ("chen", "azl", self.azl)):
+            with self.subTest(uploader=uploader, scope=scope):
+                routes = dict(self.routes)
+                routes[uploader] = {
+                    "private": {"enabled": True, "scope": scope,
+                                "destination": str(destination)},
+                    "shared": {"enabled": False},
+                }
+                self.write_policy(routes=routes)
+                with self.assertRaises(ki.ImportPolicyError):
+                    self.load_policy()
 
     def test_invalid_policy_fail_closed(self) -> None:
         bad = [
@@ -441,10 +485,11 @@ class ImporterTests(unittest.TestCase):
         with patch.object(ki, "reject_symlink_components", side_effect=reject_other):
             self.assertEqual([row.original_filename for row in importer.run()], [own.name])
 
-    def test_unknown_uploader_fails_before_scanning_or_state_creation(self) -> None:
-        with self.assertRaises(ki.ImportPolicyError):
-            self.per_user_importer("azl")
-        self.assertFalse((self.root / "state" / "azl").exists())
+    def test_uploader_absent_from_policy_fails_before_scanning_or_state_creation(self) -> None:
+        for uploader in ("azl", "unknown"):
+            with self.subTest(uploader=uploader), self.assertRaises(ki.ImportPolicyError):
+                self.per_user_importer(uploader)
+            self.assertFalse((self.root / "state" / uploader).exists())
 
     def test_invalid_uploader_fails_closed(self) -> None:
         for name in ("../liang", "bad/name", "", "a" * 129):

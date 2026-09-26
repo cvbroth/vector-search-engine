@@ -35,7 +35,7 @@ class CalibrationTests(unittest.TestCase):
             self.assertEqual(load_cases(path)[0].scope, "family")
 
             path.write_text(
-                '[{"query":"test","scope":"liang","expected_relevant":true}]',
+                '[{"query":"test","scope":"ziling","expected_relevant":true}]',
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(ValueError, "unsupported scope"):

@@ -15,7 +15,11 @@
       }
     },
     "liang": {
-      "private": { "enabled": false },
+      "private": {
+        "enabled": true,
+        "scope": "liang",
+        "destination": "/srv/storage/knowledge/private/liang"
+      },
       "shared": {
         "enabled": true,
         "scope": "family",
@@ -23,7 +27,11 @@
       }
     },
     "azl": {
-      "private": { "enabled": false },
+      "private": {
+        "enabled": true,
+        "scope": "azl",
+        "destination": "/srv/storage/knowledge/private/azl"
+      },
       "shared": {
         "enabled": true,
         "scope": "family",

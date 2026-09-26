@@ -21,11 +21,11 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Any, Mapping
 
-from config import KNOWLEDGE_SCOPES, get_scope, reject_symlink_components
+from config import KNOWLEDGE_SCOPES, PRIVATE_SCOPE_BY_AGENT, get_scope, reject_symlink_components
 
 POLICY_PATH = Path("/etc/knowledge-broker/policy.json")
 BACKEND_SOCKET_PATH = Path("/run/knowledge-base/backend.sock")
@@ -133,6 +133,8 @@ def load_policy(path: Path = POLICY_PATH) -> BrokerPolicy:
     for agent_id, rule in raw_agents.items():
         if not isinstance(agent_id, str) or AGENT_ID_PATTERN.fullmatch(agent_id) is None:
             raise PolicyError("invalid agent ID in policy")
+        if agent_id not in PRIVATE_SCOPE_BY_AGENT:
+            raise PolicyError("unknown agent ID in policy")
         if not isinstance(rule, dict) or set(rule) != {"private_scope", "shared"}:
             raise PolicyError("each agent must have private_scope and shared only")
         private_scope = rule["private_scope"]
@@ -141,6 +143,8 @@ def load_policy(path: Path = POLICY_PATH) -> BrokerPolicy:
                 raise PolicyError("policy refers to an unknown private scope")
             if get_scope(private_scope).area != "private":
                 raise PolicyError("private_scope must be a private knowledge scope")
+            if private_scope != PRIVATE_SCOPE_BY_AGENT[agent_id]:
+                raise PolicyError("private_scope does not match agent identity")
         if type(rule["shared"]) is not bool:
             raise PolicyError("shared must be a boolean")
         agents[agent_id] = AgentPolicy(private_scope, rule["shared"])
@@ -168,6 +172,16 @@ def validate_request(value: Any) -> tuple[str, str, int]:
 
 def _is_number(value: Any) -> bool:
     return type(value) in (float, int) and math.isfinite(value)
+
+
+def _is_scope_source_path(source_path: str, filename: str, scope: str) -> bool:
+    """The backend may only return evidence from the authorized source root."""
+    if not source_path.startswith("/") or "\\" in source_path:
+        return False
+    path = PurePosixPath(source_path)
+    root = PurePosixPath(get_scope(scope).source_dir.as_posix())
+    return (str(path) == source_path and ".." not in path.parts
+            and path != root and path.is_relative_to(root) and path.name == filename)
 
 
 def validate_backend_context(value: Any, query: str, scope: str, top_k: int) -> dict[str, Any]:
@@ -206,6 +220,7 @@ def validate_backend_context(value: Any, query: str, scope: str, top_k: int) -> 
             or item["relevance_decision"] not in {"ACCEPT", "UNCERTAIN"}
             or not isinstance(item["source_path"], str)
             or not isinstance(item["filename"], str)
+            or not _is_scope_source_path(item["source_path"], item["filename"], scope)
             or (item["page"] is not None and (type(item["page"]) is not int or item["page"] < 1))
             or type(item["chunk_index"]) is not int or item["chunk_index"] < 0
             or not isinstance(item["text"], str)
