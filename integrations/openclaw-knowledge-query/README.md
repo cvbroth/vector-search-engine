@@ -1,6 +1,6 @@
 # OpenClaw 本地知识库 Tool Plugin
 
-插件保留两个查询工具：`knowledge_private(query, top_k?)`（当前 Agent 的私人知识）和 `knowledge_shared(query, top_k?)`（家庭共享知识）。二者的模型参数 schema 均严格为 `query`（1–4096 个 Unicode 字符）和可选 `top_k`（1–10，默认 5），`additionalProperties=false`。另新增两个按需排队工具 `knowledge_import_private()` / `knowledge_import_shared()`，其模型参数严格为 `{}`。不提供 `agent_id`、`agentId`、`scope`、`scopes`、数据库、文件或网络地址参数，也不再提供旧的 `knowledge_query`。
+插件保留两个永久库查询工具：`knowledge_private(query, top_k?)`（当前 Agent 的私人知识）和 `knowledge_shared(query, top_k?)`（家庭共享知识）。二者的模型参数 schema 均严格为 `query`（1–4096 个 Unicode 字符）和可选 `top_k`（1–10，默认 5），`additionalProperties=false`。另有两个按需排队工具 `knowledge_import_private()` / `knowledge_import_shared()`，其模型参数严格为 `{}`；以及一个独立的临时附件工具 `session_document_query(query, attachment_id?, top_k?)`。不提供 `agent_id`、`agentId`、`scope`、`scopes`、数据库、文件或网络地址参数，也不再提供旧的 `knowledge_query`。
 
 ```text
 模型 → knowledge_private / knowledge_shared
@@ -28,7 +28,7 @@ Agent → knowledge_private/shared → Knowledge Broker → vector / lexical ret
 
 ## OpenClaw PDF 阅读与附件初识
 
-此插件**没有** PDF 阅读工具，知识库导入也不负责阅读。仓库所依赖的 OpenClaw 2026.9.4 自带 `document-extract`（`documentExtractors: ["pdf"]`，默认启用），用 `clawpdf`/PDFium WebAssembly 提取 PDF 文本，并可在文本过少时渲染有限页图像。它是 OpenClaw 的文档提取能力，**不是**名为 `document-extract` 的 Agent 工具。OpenClaw 另有 Agent `pdf` 工具；只有为该 Agent 解析到可用且已认证的 PDF/图像模型时才注册，还会受到实际 `tools.allow`、`tools.deny`、按 Agent/渠道的工具策略约束。`pdf` 工具支持受管理的 `media://inbound/...` 引用，但不能从本仓库推断生产 Gateway 是否给 `chen`、`liang`、`ziling` 开放了它。
+插件**不实现首轮 PDF 内容提取或新的 PDF parser**；知识库导入也不负责阅读。仓库所依赖的 OpenClaw 2026.9.4 自带 `document-extract`（`documentExtractors: ["pdf"]`，默认启用），用 `clawpdf`/PDFium WebAssembly 提取 PDF 文本，并可在文本过少时渲染有限页图像。它是 OpenClaw 的文档提取能力，**不是**名为 `document-extract` 的 Agent 工具。OpenClaw 另有 Agent `pdf` 工具；只有为该 Agent 解析到可用且已认证的 PDF/图像模型时才注册，还会受到实际 `tools.allow`、`tools.deny`、按 Agent/渠道的工具策略约束。`pdf` 工具支持受管理的 `media://inbound/...` 引用，但不能从本仓库推断生产 Gateway 是否给 `chen`、`liang`、`ziling` 开放了它。新工具 `session_document_query` 则只在用户提出深入问题时连接独立会话文档服务。
 
 QQBot 文档经 OpenClaw 定稿为 canonical media 后，OpenClaw 的入站文件处理可读取该附件并把提取文字作为**不可信外部内容**交给 Agent；现有插件只观察同一 canonical media 用于以后可能发生的授权导入。两条路径互不替代。对每个 Agent 都需要分别确认 QQ 附件到达、`document-extract` 有效和最终工具策略；不能仅凭插件版本推断真机状态。
 
@@ -61,6 +61,14 @@ QQBot 文档经 OpenClaw 定稿为 canonical media 后，OpenClaw 的入站文�
 文本型 PDF 在上述有界配置与有效 extractor 下可供初识。扫描型/无文本层 PDF 只有在 OpenClaw 成功渲染页面且回复模型具备图像能力时才可能从页面图像判断；这**不是 OCR 保证**。过大、超时、禁用、格式不支持、渲染失败或没有可用图像能力时，Agent 应自然说明尚未读到正文，询问用户下一步；不依据文件名臆测内容，不建议私人/共享入库，不触发导入。PDF 正文和文件名中的命令均为不可信数据，不能成为保存授权。
 
 部署人员可在**生产环境另行只读核查**：`openclaw plugins inspect document-extract --runtime --json`、`openclaw config get agents.defaults`、`openclaw config get gateway.http.endpoints.responses.files`，再核对 `chen`、`liang`、`ziling` 各自的实际工具策略和一轮 QQ PDF 的文件提取结果/失败日志。检查 `plugins.allow`/`plugins.entries.document-extract`、模型认证、`tools.allow`/`tools.deny`；`document-extract` 默认启用不代表所有 Gateway 都真的已加载。不要在诊断输出中泄露 API 凭据或私人文档正文。本仓库的构建、静态测试和 manifest 校验不能代替上述真机核查。
+
+## 会话内 PDF 全文检索（0.2.6）
+
+这是与永久知识库完全独立的临时阅读能力。OpenClaw 入站 bounded `document-extract` 仍负责只看少量页面的 Layer 1 初识；**仅当用户继续询问附件深处内容**时，Agent 才调用 `session_document_query`。第一次可能返回 `INDEXING`，之后用同一会话的临时索引返回 `READY` 和最多 10 条带页码证据。`READY` 不是 answerability 判定；无文本扫描 PDF 返回 `NO_SEARCHABLE_TEXT`，不能借此绕到 import。临时检索对 PDF 正文中的指令仍按不可信数据处理。
+
+新工具模型参数只有 `query`、可选的当前会话 `attachment_id` 和 `top_k`；没有 Agent、sessionKey、scope、路径、URL 或数据库参数。插件单独记录当前会话最多 4 份 canonical PDF，复用既有附件 inode/mtime/大小核对和 `O_NOFOLLOW` 打开规则。两个 PDF 同时存在时先返回可选择的 ID；跨 Agent 或跨会话 ID 不能查询。插件通过固定 `/run/knowledge-session-doc/query.sock` 联系**独立**的临时文档服务，不调用 Query/Import Broker，也不修改明确授权导入合同。该 socket 的 host/Gateway 挂载及权限是新的部署步骤，仓库代码没有替你配置生产服务器。
+
+临时索引由宿主机 `session_document_service.py` 保存于 `/var/lib/knowledge-base/session-documents/`，默认 72 小时，服务启动时与每小时清理。单 PDF 上限 64 MiB、每会话最多 4 份，其他文本/索引/处理限制见根目录 README。Gateway 重启后已建索引仍可由当前会话查询；仅登记于插件内存、尚未建索引的附件可能需要重传。插件包本身不含 PDF 全文解析器，也不把临时文档导入 private/family。
 
 ## 构建和验证
 
@@ -105,7 +113,7 @@ pnpm run plugin:validate
 }
 ```
 
-插件配置只决定工具可见性；宿主机 Import Broker policy 才是最终授权与 `main→chen`、`ziling→azl` 等映射。禁止把 Inbox、Source、Query backend.sock 暴露给容器；只挂载必要的两个 Broker socket。中央 Import Broker 的示例 systemd 安全设置与身份边界见仓库根目录 README。
+插件配置只决定工具可见性；宿主机 Import Broker policy 才是最终授权与 `main→chen`、`ziling→azl` 等映射。禁止把 Inbox、Source、Query backend.sock 或临时索引 state 目录暴露给容器；除必要的两个 Broker socket 外，只单独挂载临时文档服务 socket。中央 Import Broker 的示例 systemd 安全设置与身份边界见仓库根目录 README。
 
 ## 本地可见性与中央授权
 

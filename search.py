@@ -135,7 +135,8 @@ def _semantic_hits(
 
 
 def _hybrid_hits(
-    connection: sqlite3.Connection, question: str, top_k: int, scope: KnowledgeScope
+    connection: sqlite3.Connection, question: str, top_k: int, scope: KnowledgeScope | None,
+    *, allowed_source_path: str | None = None,
 ) -> list[_HybridHit]:
     if not question.strip():
         raise ValueError("question must not be empty")
@@ -165,7 +166,10 @@ def _hybrid_hits(
     allowed = {
         int(row["id"]): row
         for row in rows
-        if _path_is_in_scope(str(row["source_path"]), scope)
+        if (
+            _path_is_in_scope(str(row["source_path"]), scope)
+            if scope is not None else str(row["source_path"]) == allowed_source_path
+        )
     }
     ranked_ids = sorted(
         allowed,
@@ -192,6 +196,19 @@ def _hybrid_hits(
         )
         for chunk_id in ranked_ids
     ]
+
+
+def hybrid_document_hits(
+    connection: sqlite3.Connection, question: str, top_k: int, source_path: str
+) -> list[_HybridHit]:
+    """Reuse hybrid ranking for an independently authorized, single-document DB.
+
+    A caller must open only the authorized temporary database. Exact source-path
+    matching is defense in depth and does not weaken persistent scope checks.
+    """
+    if not source_path or not source_path.startswith("/session-documents/"):
+        raise ValueError("invalid session document source")
+    return _hybrid_hits(connection, question, top_k, None, allowed_source_path=source_path)
 
 
 def hybrid_search(

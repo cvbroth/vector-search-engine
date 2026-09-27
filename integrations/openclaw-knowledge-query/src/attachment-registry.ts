@@ -1,6 +1,7 @@
 /** In-memory, bounded registry populated only by OpenClaw's trusted message hook. */
 
 import { constants, type BigIntStats } from "node:fs";
+import { randomBytes } from "node:crypto";
 import { lstat, open, type FileHandle } from "node:fs/promises";
 import path from "node:path";
 import type { PluginHookMessageReceivedEvent } from "openclaw/plugin-sdk/plugin-entry";
@@ -255,4 +256,104 @@ export class AttachmentRegistry {
   queued(attachment: Attachment): void { attachment.state = "QUEUED"; }
   tooLarge(attachment: Attachment): void { attachment.state = "TOO_LARGE"; }
   // A failed/aborted transfer may have reached the broker. Do not automatically retry.
+}
+
+/** Reading-only registry: distinct from the short-lived import consent selector. */
+export class SessionDocumentRegistry {
+  private readonly sessions = new Map<string, Array<Attachment & { attachmentId: string }>>();
+  private readonly reader = new AttachmentRegistry();
+  private readonly registrations = new Map<string, Promise<void>>();
+  static readonly TTL_MS = 72 * 60 * 60 * 1000;
+  static readonly MAX_PDFS = 4;
+  static readonly MAX_SESSIONS = 100;
+  static readonly MAX_PDF_BYTES = 64 * 1024 * 1024;
+
+  constructor(
+    private readonly now: () => number = Date.now,
+    private readonly statPath: (file: string) => Promise<BigIntStats> =
+      (file) => lstat(file, { bigint: true }),
+  ) {}
+
+  private key(agentId: string, sessionKey: string): string { return `${agentId}\0${sessionKey}`; }
+
+  private prune(): void {
+    for (const [key, docs] of this.sessions) {
+      const retained = docs.filter((doc) => this.now() - doc.receivedAt < SessionDocumentRegistry.TTL_MS);
+      if (retained.length) this.sessions.set(key, retained);
+      else this.sessions.delete(key);
+    }
+  }
+
+  async registerMessageReceived(event: PluginHookMessageReceivedEvent, ctx: MessageContext): Promise<void> {
+    const sessionKey = ctx.sessionKey;
+    const parsed = parseAgentSessionKey(sessionKey);
+    if (!sessionKey || !parsed || (event.sessionKey && event.sessionKey !== sessionKey) ||
+        (event.messageId && ctx.messageId && event.messageId !== ctx.messageId)) return;
+    const key = this.key(parsed.agentId, sessionKey);
+    const pending = this.registrations.get(key) ?? Promise.resolve();
+    const next = pending.catch(() => {}).then(async () => {
+      this.prune();
+      if (event.mediaStagingPending || !event.media?.length) return;
+      const docs = this.sessions.get(key) ?? [];
+      for (const fact of event.media) {
+        if (!fact.path || !path.isAbsolute(fact.path) ||
+            path.extname(fact.path).toLowerCase() !== ".pdf") continue;
+        const messageId = fact.messageId ?? event.messageId ?? ctx.messageId;
+        if (docs.some((doc) => doc.messageId === messageId && doc.trustedPath === fact.path)) continue;
+        if (docs.length >= SessionDocumentRegistry.MAX_PDFS) break;
+        try {
+          const info = await this.statPath(fact.path);
+          if (!info.isFile() || info.isSymbolicLink() ||
+              (info.size <= BigInt(SessionDocumentRegistry.MAX_PDF_BYTES) &&
+               docs.filter((doc) => doc.size <= BigInt(SessionDocumentRegistry.MAX_PDF_BYTES))
+                 .reduce((sum, doc) => sum + doc.size, 0n) + info.size >
+                   BigInt(SessionDocumentRegistry.MAX_PDFS * SessionDocumentRegistry.MAX_PDF_BYTES))) continue;
+          docs.push({
+            ...identity(info), attachmentId: randomBytes(16).toString("hex"),
+            trustedPath: fact.path, filename: path.basename(fact.path),
+            contentType: fact.contentType ?? "application/pdf", messageId,
+            receivedAt: this.now(), state: "READY",
+          });
+        } catch { /* An unavailable canonical file is not selectable. */ }
+      }
+      if (docs.length) this.sessions.set(key, docs);
+      while (this.sessions.size > SessionDocumentRegistry.MAX_SESSIONS) {
+        const oldest = this.sessions.keys().next().value as string | undefined;
+        if (!oldest) break;
+        this.sessions.delete(oldest);
+      }
+    });
+    this.registrations.set(key, next);
+    try { await next; }
+    finally { if (this.registrations.get(key) === next) this.registrations.delete(key); }
+  }
+
+  async waitForRegistration(agentId: string, sessionKey: string): Promise<boolean> {
+    const pending = this.registrations.get(this.key(agentId, sessionKey));
+    if (!pending) return true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        pending.then(() => true, () => false),
+        new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), REGISTRATION_WAIT_MS); }),
+      ]);
+    } finally { if (timer) clearTimeout(timer); }
+  }
+
+  list(agentId: string, sessionKey: string): Array<{ attachment_id: string; filename: string }> {
+    this.prune();
+    return (this.sessions.get(this.key(agentId, sessionKey)) ?? []).map((doc) => ({
+      attachment_id: doc.attachmentId, filename: doc.filename,
+    }));
+  }
+
+  async openDocument(agentId: string, sessionKey: string, attachmentId: string): Promise<OpenedAttachment | "NOT_FOUND" | "ATTACHMENT_CHANGED" | "TOO_LARGE" | "UNSUPPORTED_TYPE"> {
+    this.prune();
+    const doc = (this.sessions.get(this.key(agentId, sessionKey)) ?? []).find(
+      (item) => item.attachmentId === attachmentId,
+    );
+    if (!doc) return "NOT_FOUND";
+    if (doc.size > BigInt(SessionDocumentRegistry.MAX_PDF_BYTES)) return "TOO_LARGE";
+    return this.reader.openSelected(doc);
+  }
 }

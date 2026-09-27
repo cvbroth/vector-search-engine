@@ -14,6 +14,8 @@
 | `relevance.py` | 独立的三态检索判断函数；不做答案生成或事实核验 |
 | `rag_context.py` | 将现有门控检索结果转为稳定的机器可读 JSON 证据 |
 | `kb_service.py` | 仅通过宿主机 Unix socket 提供只读 RAG Context 查询接口 |
+| `session_documents.py` | 按 Agent/会话/附件隔离的临时 PDF 索引、查询、状态与 TTL 清理；不属于任何 KnowledgeScope |
+| `session_document_service.py` | 独立 Unix socket 的会话文档服务；只接收可信插件转送的 PDF 快照和会话查询 |
 | `kb_policy_broker.py` | 宿主机中央授权 Broker；按 Agent 和工具类型解析 scope 并转发到查询后端 |
 | `knowledge_importer.py` | 根据独立 policy 将稳定 Inbox 文档验证、去重、发布到正式 Source，再批量调用既有增量索引 |
 | `knowledge_import_broker.py` | 固定 Unix socket、宿主机 policy 授权，将可信附件字节流排队到映射用户的私人 Inbox；不解析或索引 |
@@ -23,7 +25,7 @@
 | `examples/knowledge-import-policy.json` | Importer policy 示例；真实账号和目录须由部署者核对 |
 | `examples/knowledge-import-broker-policy.json` | 独立的 Agent→NAS uploader 与导入权限 policy 示例 |
 | `clients/openclaw_kb_client.mjs` | 仅供可信宿主机诊断的旧式直接查询客户端；不可作为 Agent 授权入口 |
-| `integrations/openclaw-knowledge-query/` | 仅提供 `knowledge_private` / `knowledge_shared` 的 OpenClaw Tool Plugin |
+| `integrations/openclaw-knowledge-query/` | 提供永久库查询/授权导入工具，以及独立的 `session_document_query` 临时文档查询工具 |
 | `calibrate_relevance.py` | 用人工标注查询记录单库 Top1 诊断分数，汇总并扫描候选阈值；不参与生产搜索 |
 
 ## 安装依赖
@@ -423,3 +425,41 @@ python calibrate_relevance.py relevance_cases.json --output results.json
 - 程序仅通过本机 loopback HTTP 调用已存在的 Embedding 服务，不加载模型。
 - Embedding 模型或维度变更时需重新建立索引；V1 不实现模型迁移或数据库迁移。
 - 部署新增 `liang` / `azl` 前需在实际服务器上验证私人 Source、state、index、logs、锁与 Inbox 的用户权限，以及四个 scope 的隔离。索引与日志目录须由可信运行用户控制，不应允许其他本地用户并发替换路径；符号链接检查不能替代正确的目录权限。这里不代表已运行过服务器测试。
+
+## 临时会话文档检索（PDF）
+
+这是第三种、独立的数据层：**Model Conversation Context** 只放入入站提取的少量首读内容；**Session Document Store** 为当前 Agent＋当前会话的 PDF 暂存可检索片段；**Persistent Knowledge Base** 才是上述四个长期库。流程为 Upload → bounded Triage → 用户提出深入问题 → 按需建立 Session Index → 检索少量带页码证据 → Discuss → 可选建议保存 → 用户明确同意后才走原有 private/family import。上传本身不触发全文索引，临时索引也绝不会写入任何 `KnowledgeScope` 数据库。
+
+`session_document_query` 是唯一新的模型侧入口。只接受 `query`、可选的 `attachment_id`（只能从当前会话工具返回的候选中选）和 `top_k`（1–10）；Agent ID、原始 sessionKey、路径、scope、socket 均不能由模型指定。插件从可信 `toolContext` 和 canonical `message_received` 附件取得身份，重新核对普通文件的 inode/大小/mtime 并用 `O_NOFOLLOW` 打开。只有一份 PDF 时自动选择，多份 PDF 时先返回可选 ID，不猜测。插件把已打开的可信字节通过固定 `/run/knowledge-session-doc/query.sock` 送到独立本地服务；服务只信任可访问该 Unix socket 的可信 Gateway 插件。与现有 Broker 一样，同一容器内任意代码执行不构成强 Agent 身份隔离；若需抵御该威胁，必须另做每 Agent UID/容器隔离。
+
+服务将索引放在 `/var/lib/knowledge-base/session-documents/<agent>/<SHA-256(sessionKey)>/<attachment-id>/`；目录为 0700，状态/索引文件不进入 NAS Source。每份 PDF 建独立 SQLite、FTS5 trigram 与 sqlite-vec 余弦索引，复用现有 PDF parser、chunker、Embedding 和 RRF 排序核心，保留 `filename`、1-based `page`、`chunk_index`、完整证据文本。**这里没有套用永久库 0.55/0.64 的 provisional relevance gate**：返回的是待核对的 Top-K 候选，不是“答案一定存在”。扫描 PDF 没有可提取文本时返回 `NO_SEARCHABLE_TEXT`，不自动 OCR，也不改走永久导入。
+
+首次深入查询若尚无索引，工具返回 `INDEXING`；后台工作进程完成后再次查询返回 `READY`。`FAILED`、`TOO_LARGE`、`NO_ATTACHMENT`、`NOT_FOUND`、`SELECTION_REQUIRED` 都不是已找到答案。失败索引不暴露半成品；处理进程被终止后清理临时快照，重启时遗留的 `INDEXING` 状态转为失败。Gateway 重启后已建成且未过期的索引可由服务列出；尚未建索引而只在插件内存登记的附件可能需要重新上传。原始 PDF 在建索引后删除，临时索引不会长期保存原始附件副本。
+
+默认资源上限集中在 `SessionDocumentLimits`：单 PDF 64 MiB、每会话 4 份、每会话原始文件总量 256 MiB、全服务最多 32 份未过期文档、可提取文本 400 万字符、每附件 4000 chunks、每附件 SQLite 索引 128 MiB、索引墙钟超时 600 秒、同时 2 个索引进程、查询最多 10 条证据。Linux 工作进程另有限制虚拟内存/CPU 时间。超过上限拒绝，不做无提示的部分索引。这些值是第一版防耗尽边界，不保证任意 500 页 PDF 都能成功；需用实际文档测量。
+
+逻辑可见性严格按 Agent＋当前 sessionKey hash＋附件 ID 校验；换会话立即看不到旧索引。物理 TTL 默认为 **72 小时**（从索引任务创建起），可通过服务 `--ttl-hours` 调整；查询到期立即返回未找到。服务启动时和运行中每小时做幂等清理，因此持续运行时过期文件最多延迟约一小时物理删除；若服务停机，物理清理推迟到下次启动。`--cleanup` 仅供**服务已停止**时人工运行，不要与活跃索引进程并行执行。
+
+部署示例（**未应用到真实服务器**）：为服务创建专用普通 Unix 用户，并预先把上述临时 state 根目录设为其独占的 0700；将 Gateway 唯一需要的 session socket 只读/读写适当地挂载到容器，核对双方 UID/GID 与 `knowledge-docs` 组，不要挂载整个 state 目录或 Query backend socket。示例 unit 需按实际账号与容器路径审核：
+
+```ini
+[Unit]
+Description=Temporary knowledge session document service
+After=network-online.target
+
+[Service]
+Type=simple
+User=knowledge-session
+Group=knowledge-docs
+WorkingDirectory=/opt/knowledge-base
+RuntimeDirectory=knowledge-session-doc
+RuntimeDirectoryMode=0750
+UMask=0077
+ExecStart=/opt/knowledge-base/.venv/bin/python /opt/knowledge-base/session_document_service.py --root /var/lib/knowledge-base/session-documents --socket /run/knowledge-session-doc/query.sock --socket-mode 0660 --ttl-hours 72
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+```
+
+本示例不改变现有 Query/Import Broker、明确导入同意、Chen/Liang/Ziling/family 映射或任何 systemd 真机配置。上线前需另行验证 OpenClaw 对约 31.4 MiB QQ PDF 的 canonical media、三个 Agent 的工具可见性、Unix socket 挂载/权限、Embedding 服务连通与真实 500 页索引耗时；本地测试不能替代这些验证。

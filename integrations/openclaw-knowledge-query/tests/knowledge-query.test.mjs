@@ -71,7 +71,7 @@ function send(response, payload, status = 200) {
 
 test("query schemas remain limited to query and top_k", () => {
   const found = factories();
-  assert.deepEqual([...found.keys()], ["knowledge_private", "knowledge_shared", "knowledge_import_private", "knowledge_import_shared"]);
+  assert.deepEqual([...found.keys()], ["knowledge_private", "knowledge_shared", "session_document_query", "knowledge_import_private", "knowledge_import_shared"]);
   for (const name of ["knowledge_private", "knowledge_shared"]) {
     const factory = found.get(name);
     const tool = factory({ agentId: "chenAgent" });
@@ -206,7 +206,7 @@ test("timeout, cancellation, and oversized response are transport errors", async
 test("plugin metadata and source contain no shell or arbitrary URL client", async () => {
   const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
   const manifest = JSON.parse(await readFile(path.join(root, "openclaw.plugin.json"), "utf8"));
-  assert.deepEqual(manifest.contracts.tools, ["knowledge_private", "knowledge_shared", "knowledge_import_private", "knowledge_import_shared"]);
+  assert.deepEqual(manifest.contracts.tools, ["knowledge_private", "knowledge_shared", "session_document_query", "knowledge_import_private", "knowledge_import_shared"]);
   for (const name of ["index.ts", "unix-client.ts", "import-client.ts", "attachment-registry.ts"]) {
     const source = await readFile(path.join(root, "src", name), "utf8");
     assert.doesNotMatch(source, /child_process|\bexecFile\b|\bspawn\s*\(|\bexec\s*\(/);

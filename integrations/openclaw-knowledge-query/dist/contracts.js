@@ -55,3 +55,36 @@ export const importResultSchema = Type.Object({
     sha256_prefix: Type.Optional(Type.String()),
     access_kind: Type.Optional(Type.Union([Type.Literal("private"), Type.Literal("shared")])),
 }, { additionalProperties: false });
+export const sessionDocumentParameters = Type.Object({
+    query: Type.String({ minLength: 1, maxLength: 4096 }),
+    attachment_id: Type.Optional(Type.String({ pattern: "^[0-9a-f]{32}$" })),
+    top_k: Type.Optional(Type.Integer({ minimum: 1, maximum: 10 })),
+}, { additionalProperties: false });
+const sessionEvidenceSchema = Type.Object({
+    rank: Type.Integer({ minimum: 1 }),
+    filename: Type.String(),
+    page: pageSchema,
+    chunk_index: Type.Integer({ minimum: 0 }),
+    text: Type.String(),
+    fused_score: Type.Number(),
+    semantic_score: scoreSchema,
+    lexical_match: Type.Boolean(),
+}, { additionalProperties: false });
+export const sessionDocumentResultSchema = Type.Object({
+    status: Type.Union([
+        Type.Literal("INDEXING"), Type.Literal("READY"), Type.Literal("FAILED"),
+        Type.Literal("NO_SEARCHABLE_TEXT"),
+        Type.Literal("NO_ATTACHMENT"), Type.Literal("SELECTION_REQUIRED"),
+        Type.Literal("NOT_FOUND"), Type.Literal("ATTACHMENT_CHANGED"),
+        Type.Literal("TOO_LARGE"), Type.Literal("UNSUPPORTED_TYPE"),
+    ]),
+    query: Type.String(),
+    attachment_id: Type.Optional(Type.String({ pattern: "^[0-9a-f]{32}$" })),
+    filename: Type.Optional(Type.String()),
+    evidence_count: Type.Integer({ minimum: 0, maximum: 10 }),
+    evidence: Type.Array(sessionEvidenceSchema, { maxItems: 10 }),
+    available: Type.Array(Type.Object({
+        attachment_id: Type.String({ pattern: "^[0-9a-f]{32}$" }),
+        filename: Type.String(),
+    }, { additionalProperties: false }), { maxItems: 4 }),
+}, { additionalProperties: false });

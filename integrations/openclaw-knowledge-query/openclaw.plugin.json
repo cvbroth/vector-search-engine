@@ -1,8 +1,8 @@
 {
   "id": "local-knowledge-query",
   "name": "Local Knowledge Query",
-  "description": "Private and household-shared NAS query and trusted-attachment import tools.",
-  "version": "0.2.5",
+  "description": "Permanent knowledge query/import and separate temporary session-PDF retrieval tools.",
+  "version": "0.2.6",
   "configSchema": {
     "type": "object",
     "required": [
@@ -64,6 +64,7 @@
     "tools": [
       "knowledge_private",
       "knowledge_shared",
+      "session_document_query",
       "knowledge_import_private",
       "knowledge_import_shared"
     ]

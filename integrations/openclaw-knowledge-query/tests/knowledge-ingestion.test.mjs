@@ -16,14 +16,15 @@ function section(start, end) {
   return afterStart.split(end)[0];
 }
 
-test("Skill defines all seven states and only consent can lead to import", () => {
-  for (const state of ["ATTACHMENT_RECEIVED", "ATTACHMENT_TRIAGED", "ATTACHMENT_DISCUSSING",
+test("Skill defines all nine states and only consent can lead to import", () => {
+  for (const state of ["ATTACHMENT_RECEIVED", "ATTACHMENT_TRIAGED", "SESSION_INDEX_REQUIRED",
+    "SESSION_DOCUMENT_READY", "ATTACHMENT_DISCUSSING",
     "DURABLE_VALUE_CANDIDATE", "IMPORT_SUGGESTED", "IMPORT_CONSENTED", "IMPORT_QUEUED"]) {
     assert.match(skill, new RegExp(`\\b${state}\\b`));
   }
-  assert.match(skill, /Only \*\*F → an import-tool call → G on `QUEUED`\*\* is allowed/);
-  assert.match(skill, /Never call an import tool from A, B, C, D, or E/);
-  assert.match(skill, /direct, explicit import request may move from A to F/);
+  assert.match(skill, /Only \*\*H → an import-tool call → I on `QUEUED`\*\* is allowed/);
+  assert.match(skill, /Never call an import tool from A, B, C, D, E, F, or G/);
+  assert.match(skill, /direct, explicit import request may move from A to H/);
 });
 
 test("3D guide, paper, and vague look request stay at natural first-look triage", () => {
@@ -106,8 +107,8 @@ test("substantive follow-up precedes one optional suggestion; temporary and refu
 
 test("generic and specific proposals plus bare assent cannot bypass the current gate", () => {
   const consent = section("## Third layer: explicit import consent", "## Trusted attachment");
-  assert.match(consent, /“可以” after “要不要存进知识库？” lacks a destination and is not F/);
-  assert.match(consent, /“可以” after “要不要存到你的私人知识库？” also is \*\*not F in the current plugin\*\*/);
+  assert.match(consent, /“可以” after “要不要存进知识库？” lacks a destination and is not H/);
+  assert.match(consent, /“可以” after “要不要存到你的私人知识库？” also is \*\*not H in the current plugin\*\*/);
   for (const message of ["可以", "私人", "存起来"]) {
     assert.equal(parseExplicitImportConsent(message), null);
   }
