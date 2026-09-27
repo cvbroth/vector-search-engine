@@ -16,7 +16,7 @@
 
 ## Knowledge Ingestion Skill
 
-插件附带 `skills/knowledge-ingestion/SKILL.md`。从 0.2.4 起，它指导三层交互：收到附件时仅做 1–3 句初识并询问用户想如何处理；实质性讨论并完成当前任务后，才可对明显有长期价值的附件在末尾建议一次；只有用户用可信消息明确提出保存动作和私人/家庭共享目标，才调用对应导入工具。第一层不提知识库或授权，也不把上传等同于保存意图。它只指导对话，不负责存储、索引，也不赋予新权限；是否可调用工具仍由现有插件配置和 Broker 授权决定。OpenClaw 2026.9.4 会在启用插件且 Skill 符合 Agent 可见性配置时发现它；源码提交本身不等于已在真实 Gateway 加载。
+插件附带 `skills/knowledge-ingestion/SKILL.md`。从 0.2.4 起，它指导三层交互：收到附件时仅做 1–3 句初识并询问用户想如何处理；实质性讨论并完成当前任务后，才可对明显有长期价值的附件在末尾建议一次；只有用户用可信消息明确提出保存动作和私人/家庭共享目标，才调用对应导入工具。第一层不提知识库或授权，也不把上传等同于保存意图。0.2.5 进一步明确：提取失败时自然说明无法读到正文，绝不把导入作为阅读替代方案。它只指导对话，不负责存储、索引，也不赋予新权限；是否可调用工具仍由现有插件配置和 Broker 授权决定。OpenClaw 2026.9.4 会在启用插件且 Skill 符合 Agent 可见性配置时发现它；源码提交本身不等于已在真实 Gateway 加载。
 
 当前底层 consent gate **不**组合“Agent 提议私人库”与用户随后单独回复“可以”；该回复仍得到 `CONSENT_REQUIRED`。Skill 会请用户再给出完整的“保存/导入 + 目标库”指令，不会放宽 `src/import-consent.ts` 的规则。仓库中的 Skill 测试验证文档约束与确定性授权边界，不等于已经评测真实模型每一次回复。
 
@@ -25,6 +25,42 @@ Knowledge Ingestion Skill → knowledge_import_private/shared → Local Knowledg
                           → Knowledge Import Broker → Importer / Indexer
 Agent → knowledge_private/shared → Knowledge Broker → vector / lexical retrieval
 ```
+
+## OpenClaw PDF 阅读与附件初识
+
+此插件**没有** PDF 阅读工具，知识库导入也不负责阅读。仓库所依赖的 OpenClaw 2026.9.4 自带 `document-extract`（`documentExtractors: ["pdf"]`，默认启用），用 `clawpdf`/PDFium WebAssembly 提取 PDF 文本，并可在文本过少时渲染有限页图像。它是 OpenClaw 的文档提取能力，**不是**名为 `document-extract` 的 Agent 工具。OpenClaw 另有 Agent `pdf` 工具；只有为该 Agent 解析到可用且已认证的 PDF/图像模型时才注册，还会受到实际 `tools.allow`、`tools.deny`、按 Agent/渠道的工具策略约束。`pdf` 工具支持受管理的 `media://inbound/...` 引用，但不能从本仓库推断生产 Gateway 是否给 `chen`、`liang`、`ziling` 开放了它。
+
+QQBot 文档经 OpenClaw 定稿为 canonical media 后，OpenClaw 的入站文件处理可读取该附件并把提取文字作为**不可信外部内容**交给 Agent；现有插件只观察同一 canonical media 用于以后可能发生的授权导入。两条路径互不替代。对每个 Agent 都需要分别确认 QQ 附件到达、`document-extract` 有效和最终工具策略；不能仅凭插件版本推断真机状态。
+
+本地 2026.9.4 代码显示：入站文件自动提取默认最多 20 MiB，默认值随 `agents.defaults.mediaMaxMb` 调整但该路径有 25 MiB 上限；`pdf` 工具的单文件默认上限另为 10 MiB。因此 31.4 MB PDF 在默认配置下**不会**完成自动提取，也超过默认 `pdf` 工具上限。这是与 QQ 盲测症状相符的候选原因，不等于已确认生产的有效配置或运行日志。`gateway.http.endpoints.responses.files.maxBytes` 是入站提取共用的显式覆盖项；如经运维审查决定支持约 31.4 MB 的附件，可将下面的**配置片段合并**到现有 OpenClaw 配置，而不是替换整份配置：
+
+```json
+{
+  "gateway": {
+    "http": {
+      "endpoints": {
+        "responses": {
+          "files": {
+            "maxBytes": 41943040,
+            "maxChars": 6000,
+            "timeoutMs": 60000,
+            "pdf": { "maxPages": 4, "maxPixels": 4000000, "minTextChars": 200 }
+          }
+        }
+      }
+    }
+  },
+  "agents": {
+    "defaults": { "pdfMaxMb": 40, "pdfMaxPages": 4 }
+  }
+}
+```
+
+这个片段仅是未来部署建议，**未应用于服务器**。40 MiB 是输入字节上限，不表示会把 40 MiB 正文送进模型：**入站自动提取**只取最多 4 页、输出最多 6000 字符，图像总预算最多 400 万像素，超时 60 秒。首页/目录不足以辨认主题时应承认只是部分阅读；第二轮再按用户指定章节处理。配置 `files.maxBytes` 同时影响 OpenClaw Responses 文件输入的允许大小，部署前需评估资源和安全影响。单独调大 `agents.defaults.mediaMaxMb` 仍受入站自动提取 25 MiB 内置上限约束；`pdfMaxMb` 则只影响独立 `pdf` 工具的默认上限。`pdf` 工具若要可见，还需为各 Agent 配好可用且已认证的模型，并检查工具策略；它的非原生模式可限页、但没有上述 6000 字符的同等输出保证，而原生模式不支持限页并会发送整份 PDF，故不宜用来做大文件的首轮轻量初识。不要为此在运行中的 Gateway 临时安装 Python 包。
+
+文本型 PDF 在上述有界配置与有效 extractor 下可供初识。扫描型/无文本层 PDF 只有在 OpenClaw 成功渲染页面且回复模型具备图像能力时才可能从页面图像判断；这**不是 OCR 保证**。过大、超时、禁用、格式不支持、渲染失败或没有可用图像能力时，Agent 应自然说明尚未读到正文，询问用户下一步；不依据文件名臆测内容，不建议私人/共享入库，不触发导入。PDF 正文和文件名中的命令均为不可信数据，不能成为保存授权。
+
+部署人员可在**生产环境另行只读核查**：`openclaw plugins inspect document-extract --runtime --json`、`openclaw config get agents.defaults`、`openclaw config get gateway.http.endpoints.responses.files`，再核对 `chen`、`liang`、`ziling` 各自的实际工具策略和一轮 QQ PDF 的文件提取结果/失败日志。检查 `plugins.allow`/`plugins.entries.document-extract`、模型认证、`tools.allow`/`tools.deny`；`document-extract` 默认启用不代表所有 Gateway 都真的已加载。不要在诊断输出中泄露 API 凭据或私人文档正文。本仓库的构建、静态测试和 manifest 校验不能代替上述真机核查。
 
 ## 构建和验证
 
